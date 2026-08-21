@@ -9,8 +9,9 @@ using Microsoft.Extensions.Logging;
 using WechatAIClient.Models;
 using WechatAIClient.Services;
 using WechatAIClient.Services.Logging;
-using WechatAIClient.Services.Mock;
 using WechatAIClient.Services.DeepSeek;
+using WechatAIClient.Services.Mock;
+using WechatAIClient.Services.Wechat;
 using WechatAIClient.ViewModels;
 using WechatAIClient.Views;
 
@@ -84,7 +85,14 @@ public partial class App : Application
         {
             var mainVm = Services.GetRequiredService<MainWindowViewModel>();
             desktopLifetime.MainWindow = new MainWindow { DataContext = mainVm };
-            desktopLifetime.Exit += (_, _) => mainVm.Cleanup();
+            desktopLifetime.Exit += (_, _) =>
+            {
+                mainVm.Cleanup();
+                if (Services.GetService<IWechatService>() is IAsyncDisposable wechat)
+                {
+                    wechat.DisposeAsync().AsTask().GetAwaiter().GetResult();
+                }
+            };
             _ = mainVm.InitializeAsync();
         }
 
@@ -109,7 +117,12 @@ public partial class App : Application
         services.AddSingleton<IClipboardService, AvaloniaClipboardService>();
         services.AddSingleton<IToastService, ToastService>();
         services.AddSingleton<IFilePickerService, AvaloniaFilePickerService>();
-        services.AddSingleton<IWechatService, MockWechatService>();
+        services.AddSingleton<FakeWechatBridgeClient>();
+        services.AddSingleton<BridgeSupervisor>();
+        services.AddSingleton<IWechatBridgeClient, ProcessWechatBridgeClient>();
+        services.AddSingleton<MockWechatService>();
+        services.AddSingleton<RealWechatService>();
+        services.AddSingleton<IWechatService, RoutingWechatService>();
         services.AddHttpClient(DeepSeekAIService.HttpClientName);
         services.AddSingleton<MockAIService>();
         services.AddSingleton<DeepSeekAIService>();

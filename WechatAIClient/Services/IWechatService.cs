@@ -5,6 +5,12 @@ namespace WechatAIClient.Services;
 public interface IWechatService
 {
     event EventHandler<MessageReceivedEventArgs>? MessageReceived;
+    event EventHandler<WechatConnectionState>? ConnectionStateChanged;
+
+    WechatConnectionState ConnectionState { get; }
+
+    Task<WechatConnectionState> GetConnectionStateAsync(CancellationToken cancellationToken = default);
+    Task<WechatAccountInfo?> GetCurrentAccountAsync(CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<Contact>> GetContactsAsync(CancellationToken cancellationToken = default);
     Task<IReadOnlyList<Contact>> GetGroupsAsync(CancellationToken cancellationToken = default);
@@ -25,6 +31,15 @@ public interface IWechatService
         string? imagePath = null,
         bool isFromAi = false,
         CancellationToken cancellationToken = default);
+
+    Task<SendMessageResult> SendTextMessageAsync(
+        string contactId,
+        string content,
+        bool isFromAi = false,
+        string? clientRequestId = null,
+        CancellationToken cancellationToken = default);
+
+    Task ReconnectAsync(CancellationToken cancellationToken = default);
 
     Task SimulateIncomingMessageAsync(
         string contactId,

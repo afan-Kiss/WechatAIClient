@@ -108,7 +108,7 @@ public partial class ContactListViewModel : ViewModelBase
 
     private void OnMessageReceived(object? sender, MessageReceivedEventArgs e)
     {
-        Dispatcher.UIThread.Post(() =>
+        void Apply()
         {
             var contact = FindContact(e.ContactId);
             if (contact is null)
@@ -123,7 +123,16 @@ public partial class ContactListViewModel : ViewModelBase
             }
 
             BumpRecent(contact);
-        });
+        }
+
+        // Unit tests (no Avalonia lifetime): apply immediately so assertions are deterministic.
+        if (Avalonia.Application.Current is null)
+        {
+            Apply();
+            return;
+        }
+
+        Dispatcher.UIThread.Post(Apply);
     }
 
     partial void OnSearchTextChanged(string value)

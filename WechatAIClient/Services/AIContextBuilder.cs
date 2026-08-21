@@ -27,7 +27,7 @@ public sealed class AIContextBuilder : IAIContextBuilder
 
         foreach (var msg in snapshot)
         {
-            if (!TryNormalize(msg, out var content, out var source))
+            if (!TryNormalize(msg, input.IsGroup, out var content, out var source))
             {
                 filteredOut++;
                 continue;
@@ -78,7 +78,7 @@ public sealed class AIContextBuilder : IAIContextBuilder
                 continue;
             }
 
-            if (!TryNormalize(original, out var pinContent, out var pinSource))
+            if (!TryNormalize(original, input.IsGroup, out var pinContent, out var pinSource))
             {
                 continue;
             }
@@ -161,7 +161,7 @@ public sealed class AIContextBuilder : IAIContextBuilder
     public static int EstimateTokens(string? content)
         => Math.Max(1, (content?.Length ?? 0) / 4);
 
-    private static bool TryNormalize(ChatMessage msg, out string content, out MessageSource source)
+    private static bool TryNormalize(ChatMessage msg, bool isGroup, out string content, out MessageSource source)
     {
         content = string.Empty;
         source = msg.Source;
@@ -180,15 +180,16 @@ public sealed class AIContextBuilder : IAIContextBuilder
         switch (msg.Type)
         {
             case MessageType.Image:
-                content = "[图片]";
+                content = PrefixGroupSender(msg, isGroup, "[图片]");
                 source = MessageSource.AttachmentPlaceholder;
                 return true;
             case MessageType.File:
-                content = $"[文件：{msg.FileName ?? "未知"}，{msg.FileSize ?? "?"}]";
+                content = PrefixGroupSender(msg, isGroup, $"[文件：{msg.FileName ?? "未知"}，{msg.FileSize ?? "?"}]");
                 source = MessageSource.AttachmentPlaceholder;
                 return true;
             case MessageType.Emoji:
                 content = string.IsNullOrWhiteSpace(msg.Content) ? "[表情]" : msg.Content;
+                content = PrefixGroupSender(msg, isGroup, content);
                 return !string.IsNullOrWhiteSpace(content);
             case MessageType.Quote:
             case MessageType.Text:
@@ -199,8 +200,26 @@ public sealed class AIContextBuilder : IAIContextBuilder
                     return false;
                 }
 
+                content = PrefixGroupSender(msg, isGroup, content);
                 return true;
         }
+    }
+
+    private static string PrefixGroupSender(ChatMessage msg, bool isGroup, string content)
+    {
+        if (!isGroup || msg.IsSelf || string.IsNullOrWhiteSpace(msg.SenderName))
+        {
+            return content;
+        }
+
+        // Avoid double-prefix if Content already includes "张三："
+        var prefix = $"{msg.SenderName}：";
+        if (content.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            return content;
+        }
+
+        return prefix + content;
     }
 
     private static bool PassesIncludeOwnFilter(MessageSource source, bool isSelf, bool includeOwn)

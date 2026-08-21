@@ -6,6 +6,7 @@ using WechatAIClient.Helpers;
 using WechatAIClient.Models;
 using WechatAIClient.Services;
 using WechatAIClient.Services.DeepSeek;
+using WechatAIClient.Services.Wechat;
 
 namespace WechatAIClient.ViewModels;
 
@@ -17,9 +18,11 @@ public partial class MainWindowViewModel : ViewModelBase
     private readonly ISecretStore _secrets;
     private readonly IAIService _aiService;
     private readonly IToastService _toast;
+    private readonly ISettingsStore _settingsStore;
     private readonly ILogger<MainWindowViewModel> _logger;
     private readonly Dictionary<string, CancellationTokenSource> _autoDebounce = new(StringComparer.Ordinal);
     private EventHandler<MessageReceivedEventArgs>? _messageReceivedHandler;
+    private EventHandler<WechatConnectionState>? _connectionStateHandler;
     private EventHandler? _toastChangedHandler;
     private EventHandler<Contact>? _contactSelectedHandler;
     private EventHandler? _requestAiAssistHandler;
@@ -36,6 +39,7 @@ public partial class MainWindowViewModel : ViewModelBase
         ISecretStore secrets,
         IAIService aiService,
         IToastService toast,
+        ISettingsStore settingsStore,
         ILogger<MainWindowViewModel> logger)
     {
         ContactList = contactList;
@@ -47,8 +51,10 @@ public partial class MainWindowViewModel : ViewModelBase
         _secrets = secrets;
         _aiService = aiService;
         _toast = toast;
+        _settingsStore = settingsStore;
         _logger = logger;
         SelectedThemeMode = themeService.CurrentMode;
+        RefreshWechatStatus(_wechatService.ConnectionState);
 
         _contactSelectedHandler = (_, contact) =>
         {
@@ -76,6 +82,14 @@ public partial class MainWindowViewModel : ViewModelBase
 
         _messageReceivedHandler = OnMessageReceived;
         _wechatService.MessageReceived += _messageReceivedHandler;
+
+        _connectionStateHandler = (_, state) =>
+            Dispatcher.UIThread.Post(() =>
+            {
+                RefreshWechatStatus(state);
+                Chat.NotifyConnectionStateChanged();
+            });
+        _wechatService.ConnectionStateChanged += _connectionStateHandler;
 
         _toastChangedHandler = (_, _) =>
         {
@@ -173,6 +187,23 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty]
     private bool _isTestingConnection;
 
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsWechatProviderMock))]
+    [NotifyPropertyChangedFor(nameof(IsWechatProviderReal))]
+    private WechatProviderKind _settingsWechatProvider = WechatProviderKind.Real;
+
+    public bool IsWechatProviderMock => SettingsWechatProvider == WechatProviderKind.Mock;
+    public bool IsWechatProviderReal => SettingsWechatProvider == WechatProviderKind.Real;
+
+    [ObservableProperty]
+    private string _wechatStatusText = "○ 未连接";
+
+    [ObservableProperty]
+    private bool _isWechatConnected;
+
+    [ObservableProperty]
+    private bool _isWechatWarning;
+
     public async Task InitializeAsync()
     {
         try
@@ -180,6 +211,9 @@ public partial class MainWindowViewModel : ViewModelBase
             await _themeService.RestoreAsync();
             SelectedThemeMode = _themeService.CurrentMode;
             await LoadAiProviderSettingsAsync();
+            await LoadWechatProviderSettingsAsync();
+            RefreshWechatStatus(await _wechatService.GetConnectionStateAsync());
+            Chat.NotifyConnectionStateChanged();
             await ContactList.InitializeAsync();
             await AiPanel.InitializeAsync();
             if (ContactList.SelectedContact is { } selected)
@@ -225,6 +259,12 @@ public partial class MainWindowViewModel : ViewModelBase
             _messageReceivedHandler = null;
         }
 
+        if (_connectionStateHandler is not null)
+        {
+            _wechatService.ConnectionStateChanged -= _connectionStateHandler;
+            _connectionStateHandler = null;
+        }
+
         if (_toastChangedHandler is not null)
         {
             _toast.Changed -= _toastChangedHandler;
@@ -240,6 +280,63 @@ public partial class MainWindowViewModel : ViewModelBase
         _autoDebounce.Clear();
         Chat.Cleanup();
         ContactList.Cleanup();
+        AiPanel.CancelGenerationCommand.Execute(null);
+        if (_wechatService is IAsyncDisposable asyncDisposable)
+        {
+            asyncDisposable.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    private void RefreshWechatStatus(WechatConnectionState state)
+    {
+        IsWechatConnected = state == WechatConnectionState.Connected;
+        IsWechatWarning = state is WechatConnectionState.VersionUnsupported
+            or WechatConnectionState.BridgeError;
+        WechatStatusText = state switch
+        {
+            WechatConnectionState.Connected => "● 微信已连接",
+            WechatConnectionState.WechatNotRunning => "○ 微信未运行",
+            WechatConnectionState.WaitingForLogin => "○ 等待微信登录",
+            WechatConnectionState.Connecting => "○ 正在连接微信…",
+            WechatConnectionState.VersionUnsupported => "⚠ 当前微信版本暂不兼容",
+            WechatConnectionState.BridgeError => "⚠ 微信连接异常",
+            _ => "○ 微信未连接"
+        };
+    }
+
+    private async Task LoadWechatProviderSettingsAsync()
+    {
+        try
+        {
+            var raw = await _settingsStore.GetAsync(RoutingWechatService.ProviderSettingsKey);
+            SettingsWechatProvider = string.Equals(raw, "Mock", StringComparison.OrdinalIgnoreCase)
+                ? WechatProviderKind.Mock
+                : WechatProviderKind.Real;
+            if (_wechatService is RoutingWechatService routing)
+            {
+                await routing.SwitchProviderAsync(SettingsWechatProvider);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to load WeChat provider settings");
+        }
+    }
+
+    private bool EnsureWechatConnectedForSend()
+    {
+        if (_wechatService.ConnectionState == WechatConnectionState.Connected)
+        {
+            return true;
+        }
+
+        _ = _toast.ShowAsync(WechatStatusText);
+        if (!string.IsNullOrWhiteSpace(AiPanel.LatestGeneratedReply))
+        {
+            // keep candidate visible
+        }
+
+        return false;
     }
 
     [RelayCommand]
@@ -312,6 +409,57 @@ public partial class MainWindowViewModel : ViewModelBase
         SettingsAiProvider = string.Equals(provider, "DeepSeek", StringComparison.OrdinalIgnoreCase)
             ? AIProviderKind.DeepSeek
             : AIProviderKind.Mock;
+    }
+
+    [RelayCommand]
+    private async Task SetWechatProviderAsync(string provider)
+    {
+        SettingsWechatProvider = string.Equals(provider, "Mock", StringComparison.OrdinalIgnoreCase)
+            ? WechatProviderKind.Mock
+            : WechatProviderKind.Real;
+        try
+        {
+            if (_wechatService is RoutingWechatService routing)
+            {
+                await routing.SwitchProviderAsync(SettingsWechatProvider);
+            }
+            else
+            {
+                await _settingsStore.SetAsync(
+                    RoutingWechatService.ProviderSettingsKey,
+                    SettingsWechatProvider.ToString());
+            }
+
+            RefreshWechatStatus(await _wechatService.GetConnectionStateAsync());
+            Chat.NotifyConnectionStateChanged();
+            await ContactList.InitializeAsync();
+            await _toast.ShowAsync(SettingsWechatProvider == WechatProviderKind.Mock
+                ? "已切换到 Mock 微信"
+                : "已切换到真实微信接入");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to switch wechat provider");
+            await _toast.ShowAsync("切换失败");
+        }
+    }
+
+    [RelayCommand]
+    private async Task ReconnectWechatAsync()
+    {
+        try
+        {
+            WechatStatusText = "○ 正在重连…";
+            await _wechatService.ReconnectAsync();
+            RefreshWechatStatus(await _wechatService.GetConnectionStateAsync());
+            Chat.NotifyConnectionStateChanged();
+            await _toast.ShowAsync(IsWechatConnected ? "微信已连接" : WechatStatusText);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "WeChat reconnect failed");
+            await _toast.ShowAsync("重连失败");
+        }
     }
 
     [RelayCommand]
@@ -471,6 +619,11 @@ public partial class MainWindowViewModel : ViewModelBase
 
         if (AiPanel.ReplyMode == AIReplyMode.Auto)
         {
+            if (!EnsureWechatConnectedForSend())
+            {
+                return;
+            }
+
             await Chat.SendAsync(contact.Id, result.Content, isFromAi: true);
         }
         else if (AiPanel.ReplyMode == AIReplyMode.ManualConfirm)
@@ -532,8 +685,17 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private void OnMessageReceived(object? sender, MessageReceivedEventArgs e)
     {
-        if (e.Message.IsSelf || e.Message.IsFromAi)
+        if (e.Message.IsSelf ||
+            e.Message.IsFromAi ||
+            e.Message.Source is MessageSource.LocalUserAI or MessageSource.LocalUserManual)
         {
+            return;
+        }
+
+        if (_wechatService.ConnectionState != WechatConnectionState.Connected &&
+            AiPanel.ReplyMode == AIReplyMode.Auto)
+        {
+            // Auto must not send while disconnected; Manual can still generate later.
             return;
         }
 
@@ -652,6 +814,13 @@ public partial class MainWindowViewModel : ViewModelBase
 
             if (autoSend)
             {
+                if (!EnsureWechatConnectedForSend())
+                {
+                    AiPanel.LatestGeneratedReply = result.Content;
+                    await _toast.ShowAsync("微信未连接，回复已保留为候选");
+                    return;
+                }
+
                 await Chat.SendAsync(contactId, result.Content, isFromAi: true);
             }
             else if (draftRevision is int rev)

@@ -73,7 +73,10 @@ public partial class ChatViewModel : ViewModelBase
     public bool CanSend =>
         !IsSending &&
         CurrentContact is not null &&
-        !string.IsNullOrWhiteSpace(DraftText);
+        !string.IsNullOrWhiteSpace(DraftText) &&
+        _wechatService.ConnectionState == WechatConnectionState.Connected;
+
+    public void NotifyConnectionStateChanged() => NotifyCanSendChanged();
 
     public event EventHandler<ChatMessagesChangedEventArgs>? MessagesChanged;
     public event EventHandler? MessagesUpdated;
@@ -216,8 +219,45 @@ public partial class ChatViewModel : ViewModelBase
 
         try
         {
-            var message = await _wechatService.SendMessageAsync(targetContactId, pending);
-            if (CurrentContact?.Id == targetContactId)
+            if (_wechatService.ConnectionState != WechatConnectionState.Connected)
+            {
+                DraftText = pending;
+                await _toast.ShowAsync("微信未连接，无法发送");
+                return;
+            }
+
+            var result = await _wechatService.SendTextMessageAsync(targetContactId, pending);
+            if (!result.Success)
+            {
+                if (CurrentContact?.Id == targetContactId && string.IsNullOrEmpty(DraftText))
+                {
+                    DraftText = pending;
+                }
+
+                await _toast.ShowAsync(result.ErrorMessage ?? "发送失败");
+                return;
+            }
+
+            // Prefer message from service cache via GetMessages or build from result
+            var message = new ChatMessage
+            {
+                Id = result.MessageId ?? Guid.NewGuid().ToString("N"),
+                ContactId = targetContactId,
+                ClientRequestId = result.ClientRequestId,
+                SenderName = "我",
+                IsSelf = true,
+                Source = MessageSource.LocalUserManual,
+                SenderAvatarColor = "#7C5CFF",
+                SenderInitials = "我",
+                Content = pending,
+                Timestamp = result.Timestamp,
+                SendStatus = MessageSendStatus.Sent
+            };
+
+            // RealWechatService already stores; avoid duplicate if event/path added it
+            if (CurrentContact?.Id == targetContactId &&
+                Messages.All(m => m.Id != message.Id &&
+                                  !string.Equals(m.ClientRequestId, message.ClientRequestId, StringComparison.Ordinal)))
             {
                 Messages.Add(message);
                 RaiseMessagesChanged(targetContactId, forceScroll: true);
@@ -251,13 +291,27 @@ public partial class ChatViewModel : ViewModelBase
 
         try
         {
+            if (_wechatService.ConnectionState != WechatConnectionState.Connected)
+            {
+                await _toast.ShowAsync("微信未连接，无法发送");
+                return;
+            }
+
             var message = await _wechatService.SendMessageAsync(
                 contactId,
                 content.Trim(),
                 MessageType.Text,
                 isFromAi: isFromAi);
 
-            if (CurrentContact?.Id == contactId)
+            if (message.SendStatus == MessageSendStatus.Failed)
+            {
+                await _toast.ShowAsync("发送失败");
+                return;
+            }
+
+            if (CurrentContact?.Id == contactId &&
+                Messages.All(m => m.Id != message.Id &&
+                                  !string.Equals(m.ClientRequestId, message.ClientRequestId, StringComparison.Ordinal)))
             {
                 Messages.Add(message);
                 RaiseMessagesChanged(contactId, forceScroll: IsNearBottom || KeepAtBottom);

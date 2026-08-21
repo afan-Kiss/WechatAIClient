@@ -241,6 +241,53 @@ public sealed class MockWechatService : IWechatService
     public bool ThrowOnSend { get; set; }
 
     public event EventHandler<MessageReceivedEventArgs>? MessageReceived;
+    public event EventHandler<WechatConnectionState>? ConnectionStateChanged;
+
+    public WechatConnectionState ConnectionState => WechatConnectionState.Connected;
+
+    public Task<WechatConnectionState> GetConnectionStateAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(WechatConnectionState.Connected);
+    }
+
+    public Task<WechatAccountInfo?> GetCurrentAccountAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult<WechatAccountInfo?>(
+            new WechatAccountInfo("mock-user", "Mock 用户", null));
+    }
+
+    public Task ReconnectAsync(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ConnectionStateChanged?.Invoke(this, WechatConnectionState.Connected);
+        return Task.CompletedTask;
+    }
+
+    public async Task<SendMessageResult> SendTextMessageAsync(
+        string contactId,
+        string content,
+        bool isFromAi = false,
+        string? clientRequestId = null,
+        CancellationToken cancellationToken = default)
+    {
+        var clientId = string.IsNullOrWhiteSpace(clientRequestId)
+            ? Guid.NewGuid().ToString("N")
+            : clientRequestId;
+        try
+        {
+            var msg = await SendMessageAsync(
+                contactId, content, MessageType.Text, isFromAi: isFromAi, cancellationToken: cancellationToken);
+            msg.ClientRequestId = clientId;
+            msg.SendStatus = MessageSendStatus.Sent;
+            return new SendMessageResult(true, msg.Id, clientId, msg.Timestamp, null, null);
+        }
+        catch (Exception ex)
+        {
+            return new SendMessageResult(false, null, clientId, DateTime.Now, "SendFailed", ex.Message);
+        }
+    }
 
     public Task<IReadOnlyList<Contact>> GetContactsAsync(CancellationToken cancellationToken = default)
     {

@@ -3,6 +3,7 @@ namespace WechatAIClient.Models;
 public sealed class ChatMessage : System.ComponentModel.INotifyPropertyChanged
 {
     private bool _isPinned;
+    private MessageSendStatus _sendStatus = MessageSendStatus.None;
 
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
     public string ContactId { get; set; } = string.Empty;
@@ -24,6 +25,28 @@ public sealed class ChatMessage : System.ComponentModel.INotifyPropertyChanged
     public string? TimeSeparatorText { get; set; }
     public bool MentionsMe { get; set; }
     public bool QuotesMe { get; set; }
+    public string? ClientRequestId { get; set; }
+    public string? SenderId { get; set; }
+    public string? ReplyToMessageId { get; set; }
+    public string? LocalPath { get; set; }
+
+    public MessageSendStatus SendStatus
+    {
+        get => _sendStatus;
+        set
+        {
+            if (_sendStatus == value)
+            {
+                return;
+            }
+
+            _sendStatus = value;
+            PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(SendStatus)));
+            PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(IsSendFailed)));
+        }
+    }
+
+    public bool IsSendFailed => SendStatus == MessageSendStatus.Failed;
 
     /// <summary>UI-only flag; refreshed from pin list when messages load.</summary>
     public bool IsPinned

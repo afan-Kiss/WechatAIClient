@@ -67,7 +67,7 @@
                               ContentPadding="12"
                               Margin="0,0,8,0"
                               HorizontalAlignment="Left">
-            <Grid RowDefinitions="Auto,Auto,*,Auto" DataContext="{Binding ContactList}">
+            <Grid RowDefinitions="Auto,Auto,*,Auto,Auto" DataContext="{Binding ContactList}">
               <Grid ColumnDefinitions="*,Auto">
                 <TextBox Classes="search-box"
                          Text="{Binding SearchText}"
@@ -169,8 +169,30 @@
                 </ListBox.ItemTemplate>
               </ListBox>
 
-              <!-- Bottom nav: bind to MainWindow VM (not ContactList) -->
+              <!-- WeChat connection status -->
               <Border Grid.Row="3"
+                      Margin="0,8,0,0"
+                      Padding="8,6"
+                      CornerRadius="10"
+                      Background="{DynamicResource InputBackgroundBrush}"
+                      DataContext="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext)}">
+                <Grid ColumnDefinitions="*,Auto">
+                  <TextBlock Text="{Binding WechatStatusText}"
+                             FontSize="11"
+                             TextTrimming="CharacterEllipsis"
+                             VerticalAlignment="Center"
+                             Foreground="{DynamicResource TextSecondaryBrush}" />
+                  <Button Grid.Column="1"
+                          Classes="glass-button"
+                          Padding="8,3"
+                          FontSize="10"
+                          Content="重连"
+                          Command="{Binding ReconnectWechatCommand}" />
+                </Grid>
+              </Border>
+
+              <!-- Bottom nav: bind to MainWindow VM (not ContactList) -->
+              <Border Grid.Row="4"
                       Margin="0,10,0,0"
                       Padding="6"
                       CornerRadius="12"
@@ -974,6 +996,32 @@
               </Grid>
               <ScrollViewer Grid.Row="1" Margin="0,24,0,0">
                 <StackPanel Spacing="12">
+                  <Border Height="1" Background="{DynamicResource DividerBrush}" Margin="0,8" />
+
+                  <TextBlock Text="微信接入"
+                             FontWeight="SemiBold"
+                             Foreground="{DynamicResource TextBrush}" />
+                  <TextBlock Text="{Binding WechatStatusText}"
+                             FontSize="12"
+                             Foreground="{DynamicResource TextMutedBrush}" />
+                  <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Button Classes="segment"
+                            Classes.active="{Binding IsWechatProviderMock}"
+                            Command="{Binding SetWechatProviderCommand}"
+                            CommandParameter="Mock"
+                            Content="Mock" />
+                    <Button Classes="segment"
+                            Classes.active="{Binding IsWechatProviderReal}"
+                            Command="{Binding SetWechatProviderCommand}"
+                            CommandParameter="Real"
+                            Content="Real" />
+                    <Button Classes="glass-button"
+                            Content="重新连接"
+                            Command="{Binding ReconnectWechatCommand}" />
+                  </StackPanel>
+
+                  <Border Height="1" Background="{DynamicResource DividerBrush}" Margin="0,8" />
+
                   <TextBlock Text="主题"
                              Foreground="{DynamicResource TextSecondaryBrush}" />
                   <Button Classes="segment"
@@ -1089,7 +1137,7 @@
                 </StackPanel>
               </ScrollViewer>
               <TextBlock Grid.Row="2"
-                         Text="WechatAIClient · Round 3 DeepSeek"
+                         Text="WechatAIClient · Round 4 WeChat"
                          Foreground="{DynamicResource TextMutedBrush}"
                          FontSize="11"
                          HorizontalAlignment="Center" />
