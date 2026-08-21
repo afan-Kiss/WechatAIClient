@@ -12,7 +12,13 @@
                      FontWeight="SemiBold"
                      FontSize="14"
                      HorizontalAlignment="Center"
-                     VerticalAlignment="Center" />
+                     VerticalAlignment="Center"
+                     IsVisible="{TemplateBinding ImageSource, Converter={x:Static ObjectConverters.IsNull}}" />
+          <Ellipse IsVisible="{TemplateBinding ImageSource, Converter={x:Static ObjectConverters.IsNotNull}}">
+            <Ellipse.Fill>
+              <ImageBrush Source="{TemplateBinding ImageSource}" Stretch="UniformToFill" />
+            </Ellipse.Fill>
+          </Ellipse>
         </Panel>
       </ControlTemplate>
     </Setter>

@@ -78,16 +78,21 @@ public sealed class AISettingsService : IAISettingsService
         }
     }
 
-    public async Task<AIContactOverride?> GetOverrideAsync(string contactId, CancellationToken cancellationToken = default)
+    public async Task<AIContactOverride?> GetOverrideAsync(
+        string accountId,
+        string contactId,
+        CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(contactId))
         {
             return null;
         }
 
+        accountId = SqliteStore.NormalizeAccountId(accountId);
+
         try
         {
-            var json = await _store.GetAiOverrideJsonAsync(contactId, cancellationToken);
+            var json = await _store.GetAiOverrideJsonAsync(accountId, contactId, cancellationToken);
             if (string.IsNullOrWhiteSpace(json))
             {
                 return null;
@@ -99,12 +104,13 @@ public sealed class AISettingsService : IAISettingsService
                 return null;
             }
 
+            parsed.AccountId = accountId;
             parsed.ContactId = contactId;
             return parsed;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to read override for {ContactId}", contactId);
+            _logger.LogWarning(ex, "Failed to read override for {AccountId}/{ContactId}", accountId, contactId);
             return null;
         }
     }
@@ -117,6 +123,7 @@ public sealed class AISettingsService : IAISettingsService
             throw new ArgumentException("ContactId is required", nameof(overrideSettings));
         }
 
+        overrideSettings.AccountId = SqliteStore.NormalizeAccountId(overrideSettings.AccountId);
         overrideSettings.UseOverride = true;
         if (overrideSettings.ContextCount is int count)
         {
@@ -124,29 +131,44 @@ public sealed class AISettingsService : IAISettingsService
         }
 
         var json = JsonSerializer.Serialize(overrideSettings, JsonOptions);
-        await _store.SetAiOverrideJsonAsync(overrideSettings.ContactId, json, cancellationToken);
+        await _store.SetAiOverrideJsonAsync(
+            overrideSettings.AccountId,
+            overrideSettings.ContactId,
+            json,
+            cancellationToken);
     }
 
-    public Task ClearOverrideAsync(string contactId, CancellationToken cancellationToken = default)
+    public Task ClearOverrideAsync(
+        string accountId,
+        string contactId,
+        CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(contactId))
         {
             return Task.CompletedTask;
         }
 
-        return _store.DeleteAiOverrideAsync(contactId, cancellationToken);
+        return _store.DeleteAiOverrideAsync(
+            SqliteStore.NormalizeAccountId(accountId),
+            contactId,
+            cancellationToken);
     }
 
-    public async Task<EffectiveAISettings> GetEffectiveAsync(string contactId, CancellationToken cancellationToken = default)
+    public async Task<EffectiveAISettings> GetEffectiveAsync(
+        string accountId,
+        string contactId,
+        CancellationToken cancellationToken = default)
     {
+        accountId = SqliteStore.NormalizeAccountId(accountId);
         var global = await GetGlobalAsync(cancellationToken);
         var ov = string.IsNullOrWhiteSpace(contactId)
             ? null
-            : await GetOverrideAsync(contactId, cancellationToken);
+            : await GetOverrideAsync(accountId, contactId, cancellationToken);
 
         var usingOverride = ov is { UseOverride: true };
         return new EffectiveAISettings
         {
+            AccountId = accountId,
             ContactId = contactId ?? string.Empty,
             IsUsingOverride = usingOverride,
             ReplyMode = usingOverride && ov!.ReplyMode is { } rm ? rm : global.ReplyMode,
@@ -159,17 +181,27 @@ public sealed class AISettingsService : IAISettingsService
         };
     }
 
-    public Task<IReadOnlyList<string>> GetPinnedIdsAsync(string contactId, CancellationToken cancellationToken = default)
+    public Task<IReadOnlyList<string>> GetPinnedIdsAsync(
+        string accountId,
+        string contactId,
+        CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(contactId))
         {
             return Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
         }
 
-        return _store.GetPinnedMessageIdsAsync(contactId, cancellationToken);
+        return _store.GetPinnedMessageIdsAsync(
+            SqliteStore.NormalizeAccountId(accountId),
+            contactId,
+            cancellationToken);
     }
 
-    public Task SetPinnedIdsAsync(string contactId, IReadOnlyList<string> messageIds, CancellationToken cancellationToken = default)
+    public Task SetPinnedIdsAsync(
+        string accountId,
+        string contactId,
+        IReadOnlyList<string> messageIds,
+        CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(contactId))
         {
@@ -182,22 +214,31 @@ public sealed class AISettingsService : IAISettingsService
             .Take(MaxPins)
             .ToList();
 
-        return _store.SetPinnedMessageIdsAsync(contactId, clipped, cancellationToken);
+        return _store.SetPinnedMessageIdsAsync(
+            SqliteStore.NormalizeAccountId(accountId),
+            contactId,
+            clipped,
+            cancellationToken);
     }
 
-    public async Task<bool> TogglePinAsync(string contactId, string messageId, CancellationToken cancellationToken = default)
+    public async Task<bool> TogglePinAsync(
+        string accountId,
+        string contactId,
+        string messageId,
+        CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(contactId) || string.IsNullOrWhiteSpace(messageId))
         {
             return false;
         }
 
-        var pins = (await GetPinnedIdsAsync(contactId, cancellationToken)).ToList();
+        accountId = SqliteStore.NormalizeAccountId(accountId);
+        var pins = (await GetPinnedIdsAsync(accountId, contactId, cancellationToken)).ToList();
         var idx = pins.FindIndex(id => string.Equals(id, messageId, StringComparison.Ordinal));
         if (idx >= 0)
         {
             pins.RemoveAt(idx);
-            await SetPinnedIdsAsync(contactId, pins, cancellationToken);
+            await SetPinnedIdsAsync(accountId, contactId, pins, cancellationToken);
             return false;
         }
 
@@ -207,7 +248,7 @@ public sealed class AISettingsService : IAISettingsService
         }
 
         pins.Add(messageId);
-        await SetPinnedIdsAsync(contactId, pins, cancellationToken);
+        await SetPinnedIdsAsync(accountId, contactId, pins, cancellationToken);
         return true;
     }
 

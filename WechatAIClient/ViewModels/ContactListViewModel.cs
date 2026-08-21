@@ -60,18 +60,28 @@ public partial class ContactListViewModel : ViewModelBase
     }
 
     public Contact? FindContact(string contactId)
+        => FindContact(accountId: null, contactId);
+
+    public Contact? FindContact(string? accountId, string contactId)
     {
-        return _allRecent.FirstOrDefault(c => c.Id == contactId)
-               ?? _friends.FirstOrDefault(c => c.Id == contactId)
-               ?? _groups.FirstOrDefault(c => c.Id == contactId)
-               ?? VisibleContacts.FirstOrDefault(c => c.Id == contactId);
+        bool Match(Contact c) =>
+            string.Equals(c.Id, contactId, StringComparison.Ordinal) &&
+            (string.IsNullOrWhiteSpace(accountId) ||
+             string.Equals(c.AccountId, accountId, StringComparison.Ordinal));
+
+        return _allRecent.FirstOrDefault(Match)
+               ?? _friends.FirstOrDefault(Match)
+               ?? _groups.FirstOrDefault(Match)
+               ?? VisibleContacts.FirstOrDefault(Match);
     }
 
     public void BumpRecent(Contact contact)
     {
         ArgumentNullException.ThrowIfNull(contact);
 
-        _allRecent.RemoveAll(c => c.Id == contact.Id);
+        _allRecent.RemoveAll(c =>
+            c.Id == contact.Id &&
+            string.Equals(c.AccountId, contact.AccountId, StringComparison.Ordinal));
         _allRecent.Insert(0, contact);
         _allRecent = _allRecent
             .OrderByDescending(c => c.LastMessageTime)
@@ -110,14 +120,16 @@ public partial class ContactListViewModel : ViewModelBase
     {
         void Apply()
         {
-            var contact = FindContact(e.ContactId);
+            var contact = FindContact(e.AccountId, e.ContactId);
             if (contact is null)
             {
                 return;
             }
 
             // LastMessage fields are already updated by the wechat service on the shared instance.
-            if (SelectedContact?.Id != contact.Id && !e.Message.IsSelf)
+            if ((SelectedContact?.Id != contact.Id ||
+                 !string.Equals(SelectedContact?.AccountId, contact.AccountId, StringComparison.Ordinal)) &&
+                !e.Message.IsSelf)
             {
                 contact.UnreadCount++;
             }

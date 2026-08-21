@@ -217,6 +217,7 @@ public sealed class AIOrchestrator
             return new AIGenerationResult
             {
                 GenerationId = request.GenerationId,
+                AccountId = request.AccountId,
                 ContactId = request.ContactId,
                 Content = full,
                 DraftRevisionAtStart = request.DraftRevisionAtStart,

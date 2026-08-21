@@ -19,6 +19,7 @@ internal static class TestFactory
             new FakeFilePicker(),
             new FakeToast(),
             new FakeAISettings(),
+            new ConversationDraftStore(),
             NullLogger<ChatViewModel>.Instance);
     }
 
@@ -97,6 +98,9 @@ internal sealed class FakeAISettings : IAISettingsService
     private readonly Dictionary<string, List<string>> _pins = new(StringComparer.Ordinal);
     private DateTime? _pausedUntil;
 
+    private static string Key(string accountId, string contactId)
+        => $"{SqliteStore.NormalizeAccountId(accountId)}::{contactId}";
+
     public Task<AIGlobalSettings> GetGlobalAsync(CancellationToken cancellationToken = default)
         => Task.FromResult(_global);
 
@@ -106,28 +110,37 @@ internal sealed class FakeAISettings : IAISettingsService
         return Task.CompletedTask;
     }
 
-    public Task<AIContactOverride?> GetOverrideAsync(string contactId, CancellationToken cancellationToken = default)
-        => Task.FromResult(_overrides.TryGetValue(contactId, out var o) ? o : null);
+    public Task<AIContactOverride?> GetOverrideAsync(
+        string accountId,
+        string contactId,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(_overrides.TryGetValue(Key(accountId, contactId), out var o) ? o : null);
 
     public Task SaveOverrideAsync(AIContactOverride overrideSettings, CancellationToken cancellationToken = default)
     {
-        _overrides[overrideSettings.ContactId] = overrideSettings;
+        overrideSettings.AccountId = SqliteStore.NormalizeAccountId(overrideSettings.AccountId);
+        _overrides[Key(overrideSettings.AccountId, overrideSettings.ContactId)] = overrideSettings;
         return Task.CompletedTask;
     }
 
-    public Task ClearOverrideAsync(string contactId, CancellationToken cancellationToken = default)
+    public Task ClearOverrideAsync(string accountId, string contactId, CancellationToken cancellationToken = default)
     {
-        _overrides.Remove(contactId);
+        _overrides.Remove(Key(accountId, contactId));
         return Task.CompletedTask;
     }
 
-    public async Task<EffectiveAISettings> GetEffectiveAsync(string contactId, CancellationToken cancellationToken = default)
+    public async Task<EffectiveAISettings> GetEffectiveAsync(
+        string accountId,
+        string contactId,
+        CancellationToken cancellationToken = default)
     {
+        accountId = SqliteStore.NormalizeAccountId(accountId);
         var g = await GetGlobalAsync(cancellationToken);
-        var ov = await GetOverrideAsync(contactId, cancellationToken);
+        var ov = await GetOverrideAsync(accountId, contactId, cancellationToken);
         var use = ov is { UseOverride: true };
         return new EffectiveAISettings
         {
+            AccountId = accountId,
             ContactId = contactId,
             IsUsingOverride = use,
             ReplyMode = use && ov!.ReplyMode is { } rm ? rm : g.ReplyMode,
@@ -140,27 +153,38 @@ internal sealed class FakeAISettings : IAISettingsService
         };
     }
 
-    public Task<IReadOnlyList<string>> GetPinnedIdsAsync(string contactId, CancellationToken cancellationToken = default)
+    public Task<IReadOnlyList<string>> GetPinnedIdsAsync(
+        string accountId,
+        string contactId,
+        CancellationToken cancellationToken = default)
         => Task.FromResult<IReadOnlyList<string>>(
-            _pins.TryGetValue(contactId, out var list) ? list.ToList() : Array.Empty<string>());
+            _pins.TryGetValue(Key(accountId, contactId), out var list) ? list.ToList() : Array.Empty<string>());
 
-    public Task SetPinnedIdsAsync(string contactId, IReadOnlyList<string> messageIds, CancellationToken cancellationToken = default)
+    public Task SetPinnedIdsAsync(
+        string accountId,
+        string contactId,
+        IReadOnlyList<string> messageIds,
+        CancellationToken cancellationToken = default)
     {
-        _pins[contactId] = messageIds.Take(8).ToList();
+        _pins[Key(accountId, contactId)] = messageIds.Take(8).ToList();
         return Task.CompletedTask;
     }
 
-    public async Task<bool> TogglePinAsync(string contactId, string messageId, CancellationToken cancellationToken = default)
+    public async Task<bool> TogglePinAsync(
+        string accountId,
+        string contactId,
+        string messageId,
+        CancellationToken cancellationToken = default)
     {
-        var pins = (await GetPinnedIdsAsync(contactId, cancellationToken)).ToList();
+        var pins = (await GetPinnedIdsAsync(accountId, contactId, cancellationToken)).ToList();
         if (pins.Remove(messageId))
         {
-            await SetPinnedIdsAsync(contactId, pins, cancellationToken);
+            await SetPinnedIdsAsync(accountId, contactId, pins, cancellationToken);
             return false;
         }
 
         pins.Add(messageId);
-        await SetPinnedIdsAsync(contactId, pins, cancellationToken);
+        await SetPinnedIdsAsync(accountId, contactId, pins, cancellationToken);
         return true;
     }
 

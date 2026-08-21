@@ -7,6 +7,9 @@ public enum BridgeMessageKind
     Text,
     Image,
     File,
+    Emoji,
+    Video,
+    Voice,
     System
 }
 
@@ -43,6 +46,7 @@ public sealed class BridgeMessageEvent
 
 public sealed class OutgoingAcknowledgedEvent
 {
+    public string AccountId { get; init; } = string.Empty;
     public required string ClientRequestId { get; init; }
     public required string RealMessageId { get; init; }
     public required string ConversationId { get; init; }

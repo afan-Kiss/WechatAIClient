@@ -7,5 +7,8 @@ public enum MessageType
     File,
     Emoji,
     Quote,
-    System
+    System,
+    Video,
+    Voice,
+    Unknown
 }

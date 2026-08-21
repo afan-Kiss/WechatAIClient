@@ -87,10 +87,10 @@ public class SearchRaceTests
         // Let "产品" pass debounce and enter delayed SearchAsync, then supersede with "张晓彤".
         list.SearchText = "产品";
         await Task.Delay(350);
-        list.SearchText = "张晓彤";
+        list.SearchText = "李明远";
         await Task.Delay(1200);
 
-        Assert.Contains(list.VisibleContacts, c => c.Name.Contains("张晓彤", StringComparison.Ordinal));
+        Assert.Contains(list.VisibleContacts, c => c.Name.Contains("李明远", StringComparison.Ordinal));
         Assert.DoesNotContain(list.VisibleContacts, c => c.Id == "g1");
         Assert.DoesNotContain(list.VisibleContacts, c => c.Name.Contains("产品", StringComparison.Ordinal));
     }

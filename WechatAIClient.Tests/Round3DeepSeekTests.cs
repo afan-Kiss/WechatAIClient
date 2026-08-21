@@ -108,7 +108,7 @@ public class Round3DeepSeekTests
         store.Initialize();
         var settings = new AISettingsService(store, new FakeSettings(), NullLogger<AISettingsService>.Instance);
 
-        var pinned = await settings.TogglePinAsync("c1", "pin-msg-1");
+        var pinned = await settings.TogglePinAsync("legacy", "c1", "pin-msg-1");
         Assert.True(pinned);
 
         var builder = new AIContextBuilder();
@@ -126,7 +126,7 @@ public class Round3DeepSeekTests
 
         Assert.DoesNotContain(result.Messages, m => m.MessageId == "pin-msg-1");
 
-        var pinsAfter = await settings.GetPinnedIdsAsync("c1");
+        var pinsAfter = await settings.GetPinnedIdsAsync("legacy", "c1");
         Assert.Contains("pin-msg-1", pinsAfter);
     }
 
@@ -484,14 +484,14 @@ public class Round3DeepSeekTests
 
         for (var i = 0; i < 20; i++)
         {
-            Assert.True(await settings.TogglePinAsync("c1", $"m{i}"));
+            Assert.True(await settings.TogglePinAsync("legacy", "c1", $"m{i}"));
         }
 
-        var pins = await settings.GetPinnedIdsAsync("c1");
+        var pins = await settings.GetPinnedIdsAsync("legacy", "c1");
         Assert.Equal(20, pins.Count);
 
-        Assert.False(await settings.TogglePinAsync("c1", "m20"));
-        pins = await settings.GetPinnedIdsAsync("c1");
+        Assert.False(await settings.TogglePinAsync("legacy", "c1", "m20"));
+        pins = await settings.GetPinnedIdsAsync("legacy", "c1");
         Assert.Equal(20, pins.Count);
         Assert.DoesNotContain("m20", pins);
         Assert.Contains("m0", pins);

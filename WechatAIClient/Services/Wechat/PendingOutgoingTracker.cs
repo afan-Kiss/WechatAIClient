@@ -121,6 +121,14 @@ public sealed class PendingOutgoingTracker
         }
     }
 
+    public void Clear()
+    {
+        lock (_gate)
+        {
+            _pending.Clear();
+        }
+    }
+
     public static string NormalizeContent(string? content)
     {
         if (string.IsNullOrEmpty(content))

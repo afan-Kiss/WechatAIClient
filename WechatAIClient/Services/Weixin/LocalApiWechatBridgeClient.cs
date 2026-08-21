@@ -19,6 +19,7 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
     private readonly PendingOutgoingTracker _pending = new();
     private readonly GroupMemberCache _memberCache = new();
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
+    private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private readonly object _gate = new();
     private readonly List<BridgeContact> _friends = [];
     private readonly List<BridgeContact> _groups = [];
@@ -37,6 +38,8 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
     private bool _disposed;
     private bool _isApiReachable;
     private WechatCallbackMode _callbackMode = WechatCallbackMode.Auto;
+    private int _httpCallbackPort = 5000;
+    private int _tcpCallbackPort = 61108;
 
     public LocalApiWechatBridgeClient(
         ILocalWeixinApiClient api,
@@ -74,6 +77,18 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         }
     }
 
+    /// <summary>Logged-in account wxid once known.</summary>
+    public string AccountId
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _accountWxid ?? string.Empty;
+            }
+        }
+    }
+
     public event EventHandler<WechatConnectionState>? StateChanged;
     public event EventHandler<BridgeMessageEvent>? MessageReceived;
     public event EventHandler<OutgoingAcknowledgedEvent>? OutgoingAcknowledged;
@@ -81,7 +96,11 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
     public event EventHandler? BridgeCrashed;
 #pragma warning restore CS0067
 
-    public void Configure(string? baseUrl, WechatCallbackMode mode)
+    public void Configure(
+        string? baseUrl,
+        WechatCallbackMode mode,
+        int httpPort = 5000,
+        int tcpPort = 61108)
     {
         if (!string.IsNullOrWhiteSpace(baseUrl) && _api is LocalWeixinApiClient concrete)
         {
@@ -89,116 +108,93 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         }
 
         _callbackMode = mode;
+        _httpCallbackPort = httpPort > 0 ? httpPort : 5000;
+        _tcpCallbackPort = tcpPort > 0 ? tcpPort : 61108;
     }
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
-        if (_cts is not null)
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await _lifecycleGate.WaitAsync(cancellationToken);
+        try
         {
-            return;
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_cts is not null)
+            {
+                return;
+            }
+
+            try
+            {
+                _cts = new CancellationTokenSource();
+                _channel = Channel.CreateBounded<WechatBridgeEvent>(new BoundedChannelOptions(2000)
+                {
+                    FullMode = BoundedChannelFullMode.Wait,
+                    SingleReader = true,
+                    SingleWriter = false
+                });
+
+                _http = new WechatHttpCallbackServer(
+                    _parser,
+                    _channel.Writer,
+                    _loggerFactory.CreateLogger<WechatHttpCallbackServer>(),
+                    _httpCallbackPort);
+                _tcp = new WechatTcpCallbackServer(
+                    _parser,
+                    _channel.Writer,
+                    _loggerFactory.CreateLogger<WechatTcpCallbackServer>(),
+                    _tcpCallbackPort);
+
+                await StartCallbacksAsync(_callbackMode, cancellationToken);
+                SetState(WechatConnectionState.Connecting);
+                await RefreshConnectionAsync(cancellationToken);
+
+                // Health + processor only after first refresh (no race with init).
+                _processor = Task.Run(() => ProcessEventsAsync(_cts.Token), CancellationToken.None);
+                _healthLoop = Task.Run(() => HealthLoopAsync(_cts.Token), CancellationToken.None);
+            }
+            catch
+            {
+                await RollbackStartupAsync();
+                throw;
+            }
         }
-
-        _cts = new CancellationTokenSource();
-        _channel = Channel.CreateBounded<WechatBridgeEvent>(new BoundedChannelOptions(2000)
+        finally
         {
-            FullMode = BoundedChannelFullMode.Wait,
-            SingleReader = true,
-            SingleWriter = false
-        });
-
-        _http = new WechatHttpCallbackServer(
-            _parser,
-            _channel.Writer,
-            _loggerFactory.CreateLogger<WechatHttpCallbackServer>());
-        _tcp = new WechatTcpCallbackServer(
-            _parser,
-            _channel.Writer,
-            _loggerFactory.CreateLogger<WechatTcpCallbackServer>());
-
-        await StartCallbacksAsync(_callbackMode, cancellationToken);
-        SetState(WechatConnectionState.Connecting);
-        await RefreshConnectionAsync(cancellationToken);
-
-        // Health + processor only after first refresh (no race with init).
-        _processor = Task.Run(() => ProcessEventsAsync(_cts.Token), CancellationToken.None);
-        _healthLoop = Task.Run(() => HealthLoopAsync(_cts.Token), CancellationToken.None);
+            _lifecycleGate.Release();
+        }
     }
 
     public async Task StopAsync(CancellationToken cancellationToken = default)
     {
-        var cts = _cts;
-        var processor = _processor;
-        var health = _healthLoop;
-        var http = _http;
-        var tcp = _tcp;
-        var channel = _channel;
-
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await _lifecycleGate.WaitAsync(cancellationToken);
         try
         {
-            cts?.Cancel();
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            await StopCoreAsync();
         }
-        catch
+        finally
         {
-            // ignore
+            _lifecycleGate.Release();
         }
-
-        if (http is not null)
-        {
-            try
-            {
-                await http.StopAsync();
-            }
-            catch
-            {
-                // ignore
-            }
-        }
-
-        if (tcp is not null)
-        {
-            try
-            {
-                await tcp.StopAsync();
-            }
-            catch
-            {
-                // ignore
-            }
-        }
-
-        channel?.Writer.TryComplete();
-
-        await WaitTaskAsync(processor, TimeSpan.FromSeconds(3));
-        await WaitTaskAsync(health, TimeSpan.FromSeconds(3));
-
-        if (cts is not null)
-        {
-            try
-            {
-                cts.Dispose();
-            }
-            catch
-            {
-                // ignore
-            }
-        }
-
-        // Reset so StartAsync can run again.
-        _cts = null;
-        _processor = null;
-        _healthLoop = null;
-        _channel = null;
-        _http = null;
-        _tcp = null;
-        _initialized = false;
-        SetState(WechatConnectionState.Disconnected);
     }
 
     public async Task ReconnectAsync(CancellationToken cancellationToken = default)
     {
-        _initialized = false;
-        SetState(WechatConnectionState.Connecting);
-        await RefreshConnectionAsync(cancellationToken);
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await _lifecycleGate.WaitAsync(cancellationToken);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _initialized = false;
+            SetState(WechatConnectionState.Connecting);
+            await RefreshConnectionAsync(cancellationToken);
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
     }
 
     public Task<WechatAccountInfo?> GetAccountAsync(CancellationToken cancellationToken = default)
@@ -268,6 +264,7 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         bool isFromAi = false,
         CancellationToken cancellationToken = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (!IsSendReady())
         {
             return Fail(clientRequestId, "NotConnected", "微信 Hook 未连接");
@@ -291,6 +288,7 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         bool isFromAi = false,
         CancellationToken cancellationToken = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (!IsSendReady())
         {
             return Fail(clientRequestId, "NotConnected", "微信 Hook 未连接");
@@ -319,6 +317,7 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         bool isFromAi = false,
         CancellationToken cancellationToken = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         if (!IsSendReady())
         {
             return Fail(clientRequestId, "NotConnected", "微信 Hook 未连接");
@@ -357,13 +356,118 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
             return;
         }
 
-        _disposed = true;
-        await StopAsync();
+        await _lifecycleGate.WaitAsync();
+        try
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            await StopCoreAsync();
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
+
         _refreshGate.Dispose();
+        _lifecycleGate.Dispose();
     }
 
     private bool IsSendReady()
         => State is WechatConnectionState.Connected or WechatConnectionState.Degraded;
+
+    private async Task StopCoreAsync()
+    {
+        var cts = _cts;
+        var processor = _processor;
+        var health = _healthLoop;
+        var http = _http;
+        var tcp = _tcp;
+        var channel = _channel;
+
+        try
+        {
+            cts?.Cancel();
+        }
+        catch
+        {
+            // ignore
+        }
+
+        if (http is not null)
+        {
+            try
+            {
+                await http.StopAsync();
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
+        if (tcp is not null)
+        {
+            try
+            {
+                await tcp.StopAsync();
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
+        channel?.Writer.TryComplete();
+
+        await WaitTaskAsync(processor, TimeSpan.FromSeconds(3));
+        await WaitTaskAsync(health, TimeSpan.FromSeconds(3));
+
+        if (cts is not null)
+        {
+            try
+            {
+                cts.Dispose();
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
+        _cts = null;
+        _processor = null;
+        _healthLoop = null;
+        _channel = null;
+        _http = null;
+        _tcp = null;
+        _initialized = false;
+        _pending.Clear();
+        SetState(WechatConnectionState.Disconnected);
+    }
+
+    private async Task RollbackStartupAsync()
+    {
+        try
+        {
+            await StopCoreAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "RollbackStartupAsync cleanup failed");
+        }
+
+        _cts = null;
+        _processor = null;
+        _healthLoop = null;
+        _channel = null;
+        _http = null;
+        _tcp = null;
+        _initialized = false;
+    }
 
     private async Task StartCallbacksAsync(WechatCallbackMode mode, CancellationToken ct)
     {
@@ -643,6 +747,7 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
 
         _deduper.Clear();
         _memberCache.Clear();
+        _pending.Clear();
     }
 
     private async Task ProcessEventsAsync(CancellationToken token)
@@ -709,6 +814,7 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
                 StoreLocal(ack);
                 OutgoingAcknowledged?.Invoke(this, new OutgoingAcknowledgedEvent
                 {
+                    AccountId = AccountId,
                     ClientRequestId = clientRequestId,
                     RealMessageId = msg.MessageId,
                     ConversationId = msg.ConversationId,
@@ -809,6 +915,9 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
             {
                 "Image" => BridgeMessageKind.Image,
                 "File" => BridgeMessageKind.File,
+                "Emoji" => BridgeMessageKind.Emoji,
+                "Video" => BridgeMessageKind.Video,
+                "Voice" => BridgeMessageKind.Voice,
                 "System" => BridgeMessageKind.System,
                 _ => BridgeMessageKind.Text
             },

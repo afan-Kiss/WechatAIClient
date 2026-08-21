@@ -59,7 +59,7 @@ public partial class MainWindowViewModel : ViewModelBase
         _contactSelectedHandler = (_, contact) =>
         {
             Chat.LoadContactAsync(contact).SafeFireAndForget(_logger);
-            AiPanel.BindContactAsync(contact.Id).SafeFireAndForget(_logger);
+            AiPanel.BindContactAsync(contact.Id, contact.AccountId).SafeFireAndForget(_logger);
         };
         ContactList.ContactSelected += _contactSelectedHandler;
 
@@ -72,7 +72,10 @@ public partial class MainWindowViewModel : ViewModelBase
 
         _messageSentHandler = (_, contactId) =>
         {
-            var contact = ContactList.FindContact(contactId);
+            var contact = ContactList.FindContact(
+                             Chat.CurrentContact?.AccountId,
+                             contactId)
+                         ?? ContactList.FindContact(contactId);
             if (contact is not null)
             {
                 ContactList.BumpRecent(contact);
@@ -204,6 +207,14 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty]
     private bool _isWechatWarning;
 
+    [ObservableProperty]
+    private string _accountSwitcherText = "全部账号";
+
+    [ObservableProperty]
+    private bool _isAccountMenuOpen;
+
+    public System.Collections.ObjectModel.ObservableCollection<AccountMenuItem> AccountMenuItems { get; } = [];
+
     public async Task InitializeAsync()
     {
         try
@@ -214,16 +225,66 @@ public partial class MainWindowViewModel : ViewModelBase
             await LoadWechatProviderSettingsAsync();
             RefreshWechatStatus(await _wechatService.GetConnectionStateAsync());
             Chat.NotifyConnectionStateChanged();
+            RefreshAccountMenu();
             await ContactList.InitializeAsync();
             await AiPanel.InitializeAsync();
             if (ContactList.SelectedContact is { } selected)
             {
-                await AiPanel.BindContactAsync(selected.Id);
+                await AiPanel.BindContactAsync(selected.Id, selected.AccountId);
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to initialize main window");
+        }
+    }
+
+    private void RefreshAccountMenu()
+    {
+        AccountMenuItems.Clear();
+        AccountMenuItems.Add(new AccountMenuItem
+        {
+            AccountId = null,
+            Title = "全部账号",
+            IsSelected = _wechatService.SelectedAccountId is null
+        });
+        foreach (var account in _wechatService.GetAccounts())
+        {
+            AccountMenuItems.Add(new AccountMenuItem
+            {
+                AccountId = account.AccountId,
+                Title = account.DisplayName,
+                Subtitle = account.Wxid,
+                IsSelected = string.Equals(_wechatService.SelectedAccountId, account.AccountId, StringComparison.Ordinal)
+            });
+        }
+
+        AccountSwitcherText = AccountMenuItems.FirstOrDefault(a => a.IsSelected)?.Title ?? "全部账号";
+    }
+
+    [RelayCommand]
+    private void ToggleAccountMenu() => IsAccountMenuOpen = !IsAccountMenuOpen;
+
+    [RelayCommand]
+    private async Task SelectAccountMenuItemAsync(AccountMenuItem? item)
+    {
+        if (item is null)
+        {
+            return;
+        }
+
+        IsAccountMenuOpen = false;
+        await _wechatService.SelectAccountAsync(item.AccountId);
+        RefreshAccountMenu();
+        await ContactList.InitializeAsync();
+        if (ContactList.SelectedContact is { } selected)
+        {
+            await Chat.LoadContactAsync(selected);
+            await AiPanel.BindContactAsync(selected.Id, selected.AccountId);
+        }
+        else
+        {
+            await AiPanel.BindContactAsync(string.Empty, null);
         }
     }
 
@@ -565,7 +626,8 @@ public partial class MainWindowViewModel : ViewModelBase
             Chat.Messages.ToList(),
             contact.Id,
             contact.Name,
-            contact.Type == ContactType.Group);
+            contact.Type == ContactType.Group,
+            contact.AccountId);
         AiPanel.IsContextPreviewOpen = true;
     }
 
@@ -588,9 +650,13 @@ public partial class MainWindowViewModel : ViewModelBase
 
         var contact = Chat.CurrentContact;
         var draftRevision = Chat.DraftRevision;
-        var pins = await _aiSettings.GetPinnedIdsAsync(contact.Id);
+        var accountId = string.IsNullOrWhiteSpace(contact.AccountId)
+            ? (_wechatService.SelectedAccountId ?? SqliteStore.LegacyAccountId)
+            : contact.AccountId;
+        var pins = await _aiSettings.GetPinnedIdsAsync(accountId, contact.Id);
         var request = new AIGenerationRequest
         {
+            AccountId = accountId,
             ContactId = contact.Id,
             ContactName = contact.Name,
             ContextSnapshot = Chat.Messages.ToList(),
@@ -708,8 +774,11 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
-        var contact = ContactList.FindContact(e.ContactId) ??
-                      (Chat.CurrentContact?.Id == e.ContactId ? Chat.CurrentContact : null);
+        var contact = ContactList.FindContact(e.AccountId, e.ContactId) ??
+                      (Chat.CurrentContact?.Id == e.ContactId &&
+                       string.Equals(Chat.CurrentContact?.AccountId, e.AccountId, StringComparison.Ordinal)
+                          ? Chat.CurrentContact
+                          : null);
 
         if (contact?.Type == ContactType.Group)
         {
@@ -721,11 +790,11 @@ public partial class MainWindowViewModel : ViewModelBase
 
         if (AiPanel.ReplyMode == AIReplyMode.Auto)
         {
-            ScheduleAutoGenerate(e.ContactId, autoSend: true);
+            ScheduleAutoGenerate(e.AccountId, e.ContactId, e.Message.Id, autoSend: true);
         }
         else if (AiPanel.ReplyMode == AIReplyMode.ManualConfirm)
         {
-            ScheduleAutoGenerate(e.ContactId, autoSend: false);
+            ScheduleAutoGenerate(e.AccountId, e.ContactId, e.Message.Id, autoSend: false);
         }
     }
 
@@ -742,21 +811,30 @@ public partial class MainWindowViewModel : ViewModelBase
         };
     }
 
-    private void ScheduleAutoGenerate(string contactId, bool autoSend)
+    private void ScheduleAutoGenerate(string accountId, string contactId, string? triggerMessageId, bool autoSend)
     {
-        if (_autoDebounce.TryGetValue(contactId, out var existing))
+        var key = new ConversationKey(
+            SqliteStore.NormalizeAccountId(accountId),
+            contactId).StableKey;
+        if (_autoDebounce.TryGetValue(key, out var existing))
         {
             existing.Cancel();
             existing.Dispose();
         }
 
         var cts = new CancellationTokenSource();
-        _autoDebounce[contactId] = cts;
+        _autoDebounce[key] = cts;
 
-        DebouncedAutoGenerateAsync(contactId, autoSend, cts.Token).SafeFireAndForget(_logger);
+        DebouncedAutoGenerateAsync(accountId, contactId, triggerMessageId, autoSend, cts.Token)
+            .SafeFireAndForget(_logger);
     }
 
-    private async Task DebouncedAutoGenerateAsync(string contactId, bool autoSend, CancellationToken cancellationToken)
+    private async Task DebouncedAutoGenerateAsync(
+        string accountId,
+        string contactId,
+        string? triggerMessageId,
+        bool autoSend,
+        CancellationToken cancellationToken)
     {
         try
         {
@@ -771,9 +849,13 @@ public partial class MainWindowViewModel : ViewModelBase
                 return;
             }
 
-            var messages = await _wechatService.GetMessagesAsync(contactId, cancellationToken);
-            var contact = ContactList.FindContact(contactId);
-            if (contact is null && Chat.CurrentContact?.Id == contactId)
+            var resolvedAccountId = SqliteStore.NormalizeAccountId(accountId);
+            var convKey = new ConversationKey(resolvedAccountId, contactId);
+            var messages = await _wechatService.GetMessagesAsync(convKey, cancellationToken);
+            var contact = ContactList.FindContact(resolvedAccountId, contactId);
+            if (contact is null &&
+                Chat.CurrentContact?.Id == contactId &&
+                string.Equals(Chat.CurrentContact?.AccountId, resolvedAccountId, StringComparison.Ordinal))
             {
                 contact = Chat.CurrentContact;
             }
@@ -781,14 +863,22 @@ public partial class MainWindowViewModel : ViewModelBase
             var contactName = contact?.Name ?? contactId;
             var isGroup = contact?.Type == ContactType.Group;
             var replyMode = autoSend ? AIReplyMode.Auto : AIReplyMode.ManualConfirm;
-            var draftRevision = Chat.CurrentContact?.Id == contactId ? Chat.DraftRevision : (int?)null;
-            var pins = await _aiSettings.GetPinnedIdsAsync(contactId, cancellationToken);
-            var effective = await _aiSettings.GetEffectiveAsync(contactId, cancellationToken);
+            var draftRevision =
+                Chat.CurrentContact?.Id == contactId &&
+                string.Equals(Chat.CurrentContact?.AccountId, resolvedAccountId, StringComparison.Ordinal)
+                    ? Chat.DraftRevision
+                    : (int?)null;
+            var pins = await _aiSettings.GetPinnedIdsAsync(resolvedAccountId, contactId, cancellationToken);
+            var effective = await _aiSettings.GetEffectiveAsync(resolvedAccountId, contactId, cancellationToken);
 
             var request = new AIGenerationRequest
             {
+                AccountId = resolvedAccountId,
                 ContactId = contactId,
                 ContactName = contactName,
+                TriggerAccountId = resolvedAccountId,
+                TriggerConversationId = contactId,
+                TriggerMessageId = triggerMessageId,
                 ContextSnapshot = messages.ToList(),
                 ContextLength = effective.ContextCount,
                 ReplyMode = replyMode,
@@ -820,7 +910,7 @@ public partial class MainWindowViewModel : ViewModelBase
                     return;
                 }
 
-                await Chat.SendAsync(contactId, result.Content, isFromAi: true);
+                await Chat.SendAsync(resolvedAccountId, contactId, result.Content, isFromAi: true);
             }
             else if (draftRevision is int rev)
             {
@@ -837,7 +927,15 @@ public partial class MainWindowViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Auto AI reply failed for {ContactId}", contactId);
+            _logger.LogError(ex, "Auto AI reply failed for {AccountId}/{ContactId}", accountId, contactId);
         }
     }
+}
+
+public sealed class AccountMenuItem
+{
+    public string? AccountId { get; init; }
+    public string Title { get; init; } = "";
+    public string? Subtitle { get; init; }
+    public bool IsSelected { get; init; }
 }

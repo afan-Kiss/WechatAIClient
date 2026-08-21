@@ -136,6 +136,7 @@ public sealed class FakeWechatBridgeClient : IWechatBridgeClient
         {
             OutgoingAcknowledged?.Invoke(this, new OutgoingAcknowledgedEvent
             {
+                AccountId = _account?.UserId ?? string.Empty,
                 ClientRequestId = clientRequestId,
                 RealMessageId = message.Id,
                 ConversationId = message.ConversationId,

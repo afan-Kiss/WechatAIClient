@@ -26,8 +26,32 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
 
     public event EventHandler<MessageReceivedEventArgs>? MessageReceived;
     public event EventHandler<WechatConnectionState>? ConnectionStateChanged;
+    public event EventHandler<AccountConnectionStateChangedEventArgs>? AccountConnectionStateChanged;
+#pragma warning disable CS0067
+    public event EventHandler<AccountIdentityChangedEventArgs>? AccountIdentityChanged;
+#pragma warning restore CS0067
 
     public WechatConnectionState ConnectionState => _bridge.State;
+
+    public string? SelectedAccountId { get; private set; }
+
+    public IReadOnlyList<WechatAccountIdentity> GetAccounts()
+    {
+        var account = _bridge.GetAccountAsync().GetAwaiter().GetResult();
+        if (account is null)
+        {
+            return Array.Empty<WechatAccountIdentity>();
+        }
+
+        return [new WechatAccountIdentity(account.UserId, account.UserId, account.DisplayName, account.AvatarPath)];
+    }
+
+    public Task SelectAccountAsync(string? accountId, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        SelectedAccountId = string.IsNullOrWhiteSpace(accountId) ? null : accountId;
+        return Task.CompletedTask;
+    }
 
     public async Task EnsureStartedAsync(CancellationToken cancellationToken = default)
     {
@@ -102,6 +126,11 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
 
         return mapped;
     }
+
+    public Task<IReadOnlyList<ChatMessage>> GetMessagesAsync(
+        ConversationKey key,
+        CancellationToken cancellationToken = default)
+        => GetMessagesAsync(key.ConversationId, cancellationToken);
 
     public async Task<IReadOnlyList<ChatMessage>> GetMessagesAsync(
         string contactId,
@@ -227,6 +256,17 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
         return hits;
     }
 
+    public Task<ChatMessage> SendMessageAsync(
+        ConversationKey key,
+        string content,
+        MessageType type = MessageType.Text,
+        string? fileName = null,
+        string? fileSize = null,
+        string? imagePath = null,
+        bool isFromAi = false,
+        CancellationToken cancellationToken = default)
+        => SendMessageAsync(key.ConversationId, content, type, fileName, fileSize, imagePath, isFromAi, cancellationToken);
+
     public async Task<ChatMessage> SendMessageAsync(
         string contactId,
         string content,
@@ -278,6 +318,14 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
             send);
     }
 
+    public Task<SendMessageResult> SendTextMessageAsync(
+        ConversationKey key,
+        string content,
+        bool isFromAi = false,
+        string? clientRequestId = null,
+        CancellationToken cancellationToken = default)
+        => SendTextMessageAsync(key.ConversationId, content, isFromAi, clientRequestId, cancellationToken);
+
     public async Task<SendMessageResult> SendTextMessageAsync(
         string contactId,
         string content,
@@ -320,11 +368,31 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
         await RefreshContactsCacheAsync(cancellationToken);
     }
 
+    public Task ReconnectAsync(string accountId, CancellationToken cancellationToken = default)
+    {
+        _ = accountId;
+        return ReconnectAsync(cancellationToken);
+    }
+
+    public Task SimulateIncomingMessageAsync(
+        ConversationKey key,
+        string content,
+        CancellationToken cancellationToken = default)
+        => SimulateIncomingMessageAsync(key.ConversationId, content, false, false, cancellationToken);
+
     public Task SimulateIncomingMessageAsync(
         string contactId,
         string content,
         CancellationToken cancellationToken = default)
         => SimulateIncomingMessageAsync(contactId, content, false, false, cancellationToken);
+
+    public Task SimulateIncomingMessageAsync(
+        ConversationKey key,
+        string content,
+        bool mentionsMe,
+        bool quotesMe,
+        CancellationToken cancellationToken = default)
+        => SimulateIncomingMessageAsync(key.ConversationId, content, mentionsMe, quotesMe, cancellationToken);
 
     public Task SimulateIncomingMessageAsync(
         string contactId,
@@ -335,6 +403,7 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
     {
         // Real path: no-op (simulation stays on Mock / Fake bridge in tests)
         cancellationToken.ThrowIfCancellationRequested();
+        _ = (contactId, content, mentionsMe, quotesMe);
         return Task.CompletedTask;
     }
 
@@ -388,7 +457,17 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
     }
 
     private void OnBridgeStateChanged(object? sender, WechatConnectionState state)
-        => ConnectionStateChanged?.Invoke(this, state);
+    {
+        ConnectionStateChanged?.Invoke(this, state);
+        var accountId = SelectedAccountId
+                        ?? _bridge.GetAccountAsync().GetAwaiter().GetResult()?.UserId
+                        ?? "legacy";
+        AccountConnectionStateChanged?.Invoke(this, new AccountConnectionStateChangedEventArgs
+        {
+            AccountId = accountId,
+            State = state
+        });
+    }
 
     private void OnOutgoingAcknowledged(object? sender, OutgoingAcknowledgedEvent e)
     {
@@ -477,12 +556,18 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
         _ = raiseForAuto;
         MessageReceived?.Invoke(this, new MessageReceivedEventArgs
         {
+            AccountId = message.AccountId,
             ContactId = message.ContactId,
             MessageId = message.Id,
             Message = message,
             Timestamp = message.Timestamp
         });
     }
+
+    private string ResolveAccountId()
+        => SelectedAccountId
+           ?? _bridge.GetAccountAsync().GetAwaiter().GetResult()?.UserId
+           ?? "legacy";
 
     private ChatMessage MapMessage(BridgeMessage m, bool raiseSourceFromPending)
     {
@@ -495,6 +580,7 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
         return new ChatMessage
         {
             Id = m.Id,
+            AccountId = ResolveAccountId(),
             ContactId = m.ConversationId,
             SenderName = senderName,
             SenderId = m.SenderId,
@@ -506,6 +592,9 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
             {
                 BridgeMessageKind.Image => MessageType.Image,
                 BridgeMessageKind.File => MessageType.File,
+                BridgeMessageKind.Emoji => MessageType.Emoji,
+                BridgeMessageKind.Video => MessageType.Video,
+                BridgeMessageKind.Voice => MessageType.Voice,
                 BridgeMessageKind.System => MessageType.System,
                 _ => MessageType.Text
             },
@@ -536,6 +625,7 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
         return new ChatMessage
         {
             Id = result.MessageId ?? Guid.NewGuid().ToString("N"),
+            AccountId = ResolveAccountId(),
             ContactId = contactId,
             ClientRequestId = clientRequestId,
             SenderName = isFromAi ? "AI 助手" : "我",

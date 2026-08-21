@@ -240,8 +240,8 @@ public class AISettingsPersistenceTests
             IncludeOwnMessages = false
         });
 
-        var e1 = await settings.GetEffectiveAsync("c1");
-        var e2 = await settings.GetEffectiveAsync("c2");
+        var e1 = await settings.GetEffectiveAsync("legacy", "c1");
+        var e2 = await settings.GetEffectiveAsync("legacy", "c2");
         Assert.Equal(20, e1.ContextCount);
         Assert.False(e1.IncludeOwnMessages);
         Assert.True(e1.IsUsingOverride);
@@ -249,8 +249,8 @@ public class AISettingsPersistenceTests
         Assert.True(e2.IncludeOwnMessages);
         Assert.False(e2.IsUsingOverride);
 
-        await settings.ClearOverrideAsync("c1");
-        var restored = await settings.GetEffectiveAsync("c1");
+        await settings.ClearOverrideAsync("legacy", "c1");
+        var restored = await settings.GetEffectiveAsync("legacy", "c1");
         Assert.Equal(10, restored.ContextCount);
         Assert.False(restored.IsUsingOverride);
     }
@@ -266,8 +266,8 @@ public class AISettingsPersistenceTests
             new FakeSettings(),
             NullLogger<AISettingsService>.Instance);
         await settings.SaveGlobalAsync(new AIGlobalSettings { ContextCount = 5 });
-        await settings.TogglePinAsync("c1", "m1");
-        var pins = await settings.GetPinnedIdsAsync("c1");
+        await settings.TogglePinAsync("legacy", "c1", "m1");
+        var pins = await settings.GetPinnedIdsAsync("legacy", "c1");
         Assert.Contains("m1", pins);
         var global = await settings.GetGlobalAsync();
         Assert.Equal(5, global.ContextCount);

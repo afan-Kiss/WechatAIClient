@@ -6,7 +6,8 @@ namespace WechatAIClient.Services;
 
 public sealed class SqliteStore
 {
-    private const int CurrentSchemaVersion = 4;
+    private const int CurrentSchemaVersion = 5;
+    public const string LegacyAccountId = "legacy";
     public const string AiProviderSettingsKey = "ai.provider.json";
     private readonly ILogger<SqliteStore> _logger;
     private readonly string _dbPath;
@@ -146,8 +147,8 @@ public sealed class SqliteStore
             using var insert = connection.CreateCommand();
             insert.CommandText =
                 """
-                INSERT INTO ai_reply_history(id, contact_id, contact_name, status, content, created_at)
-                VALUES($id, $contactId, $contactName, $status, $content, $createdAt);
+                INSERT INTO ai_reply_history(id, contact_id, contact_name, status, content, created_at, account_id, account_name)
+                VALUES($id, $contactId, $contactName, $status, $content, $createdAt, $accountId, $accountName);
                 """;
             insert.Parameters.AddWithValue("$id", item.Id);
             insert.Parameters.AddWithValue("$contactId", item.ContactId ?? string.Empty);
@@ -155,6 +156,8 @@ public sealed class SqliteStore
             insert.Parameters.AddWithValue("$status", item.Status ?? string.Empty);
             insert.Parameters.AddWithValue("$content", item.Content ?? string.Empty);
             insert.Parameters.AddWithValue("$createdAt", item.Timestamp.ToString("O"));
+            insert.Parameters.AddWithValue("$accountId", NormalizeAccountId(item.AccountId));
+            insert.Parameters.AddWithValue("$accountName", item.AccountName ?? string.Empty);
             insert.ExecuteNonQuery();
 
             using var trim = connection.CreateCommand();
@@ -190,7 +193,7 @@ public sealed class SqliteStore
             using var command = connection.CreateCommand();
             command.CommandText =
                 """
-                SELECT id, contact_id, contact_name, status, content, created_at
+                SELECT id, contact_id, contact_name, status, content, created_at, account_id, account_name
                 FROM ai_reply_history
                 ORDER BY created_at DESC
                 LIMIT $limit;
@@ -208,7 +211,13 @@ public sealed class SqliteStore
                     ContactName = reader.IsDBNull(2) ? string.Empty : reader.GetString(2),
                     Status = reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
                     Content = reader.IsDBNull(4) ? string.Empty : reader.GetString(4),
-                    Timestamp = DateTime.TryParse(reader.GetString(5), out var ts) ? ts : DateTime.Now
+                    Timestamp = DateTime.TryParse(reader.GetString(5), out var ts) ? ts : DateTime.Now,
+                    AccountId = reader.FieldCount > 6 && !reader.IsDBNull(6)
+                        ? reader.GetString(6)
+                        : LegacyAccountId,
+                    AccountName = reader.FieldCount > 7 && !reader.IsDBNull(7)
+                        ? reader.GetString(7)
+                        : string.Empty
                 });
             }
 
@@ -344,6 +353,43 @@ public sealed class SqliteStore
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to migrate SQLite schema to v4; continuing with defaults");
+            }
+        }
+
+        if (version < 5)
+        {
+            try
+            {
+                MigrateOverridesToV5(connection);
+                MigratePinsToV5(connection);
+                EnsureColumn(connection, "ai_reply_history", "account_id", "TEXT DEFAULT 'legacy'");
+                EnsureColumn(connection, "ai_reply_history", "account_name", "TEXT");
+
+                using var profiles = connection.CreateCommand();
+                profiles.CommandText =
+                    """
+                    CREATE TABLE IF NOT EXISTS wechat_account_profiles (
+                        profile_id TEXT PRIMARY KEY,
+                        account_id TEXT NOT NULL,
+                        display_name TEXT NOT NULL DEFAULT '',
+                        base_url TEXT NOT NULL DEFAULT '',
+                        http_callback_port INTEGER NOT NULL DEFAULT 0,
+                        tcp_callback_port INTEGER NOT NULL DEFAULT 0,
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    """;
+                profiles.ExecuteNonQuery();
+
+                using var bump = connection.CreateCommand();
+                bump.CommandText = "UPDATE schema_version SET version = 5;";
+                bump.ExecuteNonQuery();
+                version = 5;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to migrate SQLite schema to v5; continuing with defaults");
             }
         }
 
@@ -502,14 +548,20 @@ public sealed class SqliteStore
         }, cancellationToken);
     }
 
-    public Task<string?> GetAiOverrideJsonAsync(string contactId, CancellationToken cancellationToken = default)
+    public Task<string?> GetAiOverrideJsonAsync(
+        string accountId,
+        string contactId,
+        CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(contactId);
+        accountId = NormalizeAccountId(accountId);
+        var memoryKey = CompositeKey(accountId, contactId);
+
         if (_useMemoryFallback)
         {
             lock (_gate)
             {
-                return Task.FromResult(_memoryOverrides.TryGetValue(contactId, out var json) ? json : null);
+                return Task.FromResult(_memoryOverrides.TryGetValue(memoryKey, out var json) ? json : null);
             }
         }
 
@@ -520,28 +572,40 @@ public sealed class SqliteStore
             {
                 using var connection = OpenConnection();
                 using var command = connection.CreateCommand();
-                command.CommandText = "SELECT json FROM ai_contact_overrides WHERE contact_id = $id LIMIT 1;";
+                command.CommandText =
+                    """
+                    SELECT json FROM ai_contact_overrides
+                    WHERE account_id = $accountId AND contact_id = $id
+                    LIMIT 1;
+                    """;
+                command.Parameters.AddWithValue("$accountId", accountId);
                 command.Parameters.AddWithValue("$id", contactId);
                 return command.ExecuteScalar() as string;
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "GetAiOverrideJson failed for {ContactId}", contactId);
+                _logger.LogWarning(ex, "GetAiOverrideJson failed for {AccountId}/{ContactId}", accountId, contactId);
                 return null;
             }
         }, cancellationToken);
     }
 
-    public Task SetAiOverrideJsonAsync(string contactId, string json, CancellationToken cancellationToken = default)
+    public Task SetAiOverrideJsonAsync(
+        string accountId,
+        string contactId,
+        string json,
+        CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(contactId);
+        accountId = NormalizeAccountId(accountId);
         json ??= "{}";
+        var memoryKey = CompositeKey(accountId, contactId);
 
         if (_useMemoryFallback)
         {
             lock (_gate)
             {
-                _memoryOverrides[contactId] = json;
+                _memoryOverrides[memoryKey] = json;
             }
 
             return Task.CompletedTask;
@@ -554,23 +618,31 @@ public sealed class SqliteStore
             using var command = connection.CreateCommand();
             command.CommandText =
                 """
-                INSERT INTO ai_contact_overrides(contact_id, json) VALUES($id, $json)
-                ON CONFLICT(contact_id) DO UPDATE SET json = excluded.json;
+                INSERT INTO ai_contact_overrides(account_id, contact_id, json)
+                VALUES($accountId, $id, $json)
+                ON CONFLICT(account_id, contact_id) DO UPDATE SET json = excluded.json;
                 """;
+            command.Parameters.AddWithValue("$accountId", accountId);
             command.Parameters.AddWithValue("$id", contactId);
             command.Parameters.AddWithValue("$json", json);
             command.ExecuteNonQuery();
         }, cancellationToken);
     }
 
-    public Task DeleteAiOverrideAsync(string contactId, CancellationToken cancellationToken = default)
+    public Task DeleteAiOverrideAsync(
+        string accountId,
+        string contactId,
+        CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(contactId);
+        accountId = NormalizeAccountId(accountId);
+        var memoryKey = CompositeKey(accountId, contactId);
+
         if (_useMemoryFallback)
         {
             lock (_gate)
             {
-                _memoryOverrides.Remove(contactId);
+                _memoryOverrides.Remove(memoryKey);
             }
 
             return Task.CompletedTask;
@@ -581,20 +653,28 @@ public sealed class SqliteStore
             cancellationToken.ThrowIfCancellationRequested();
             using var connection = OpenConnection();
             using var command = connection.CreateCommand();
-            command.CommandText = "DELETE FROM ai_contact_overrides WHERE contact_id = $id;";
+            command.CommandText =
+                "DELETE FROM ai_contact_overrides WHERE account_id = $accountId AND contact_id = $id;";
+            command.Parameters.AddWithValue("$accountId", accountId);
             command.Parameters.AddWithValue("$id", contactId);
             command.ExecuteNonQuery();
         }, cancellationToken);
     }
 
-    public Task<IReadOnlyList<string>> GetPinnedMessageIdsAsync(string contactId, CancellationToken cancellationToken = default)
+    public Task<IReadOnlyList<string>> GetPinnedMessageIdsAsync(
+        string accountId,
+        string contactId,
+        CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(contactId);
+        accountId = NormalizeAccountId(accountId);
+        var memoryKey = CompositeKey(accountId, contactId);
+
         if (_useMemoryFallback)
         {
             lock (_gate)
             {
-                if (_memoryPins.TryGetValue(contactId, out var set))
+                if (_memoryPins.TryGetValue(memoryKey, out var set))
                 {
                     return Task.FromResult<IReadOnlyList<string>>(set.ToList());
                 }
@@ -611,7 +691,11 @@ public sealed class SqliteStore
                 using var connection = OpenConnection();
                 using var command = connection.CreateCommand();
                 command.CommandText =
-                    "SELECT message_id FROM ai_pinned_messages WHERE contact_id = $id;";
+                    """
+                    SELECT message_id FROM ai_pinned_messages
+                    WHERE account_id = $accountId AND contact_id = $id;
+                    """;
+                command.Parameters.AddWithValue("$accountId", accountId);
                 command.Parameters.AddWithValue("$id", contactId);
                 var list = new List<string>();
                 using var reader = command.ExecuteReader();
@@ -624,25 +708,28 @@ public sealed class SqliteStore
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "GetPinnedMessageIds failed for {ContactId}", contactId);
+                _logger.LogWarning(ex, "GetPinnedMessageIds failed for {AccountId}/{ContactId}", accountId, contactId);
                 return Array.Empty<string>();
             }
         }, cancellationToken);
     }
 
     public Task SetPinnedMessageIdsAsync(
+        string accountId,
         string contactId,
         IReadOnlyList<string> messageIds,
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(contactId);
+        accountId = NormalizeAccountId(accountId);
         messageIds ??= Array.Empty<string>();
+        var memoryKey = CompositeKey(accountId, contactId);
 
         if (_useMemoryFallback)
         {
             lock (_gate)
             {
-                _memoryPins[contactId] = new HashSet<string>(
+                _memoryPins[memoryKey] = new HashSet<string>(
                     messageIds.Where(id => !string.IsNullOrWhiteSpace(id)).Take(20),
                     StringComparer.Ordinal);
             }
@@ -658,7 +745,9 @@ public sealed class SqliteStore
             using (var del = connection.CreateCommand())
             {
                 del.Transaction = tx;
-                del.CommandText = "DELETE FROM ai_pinned_messages WHERE contact_id = $id;";
+                del.CommandText =
+                    "DELETE FROM ai_pinned_messages WHERE account_id = $accountId AND contact_id = $id;";
+                del.Parameters.AddWithValue("$accountId", accountId);
                 del.Parameters.AddWithValue("$id", contactId);
                 del.ExecuteNonQuery();
             }
@@ -668,7 +757,11 @@ public sealed class SqliteStore
                 using var insert = connection.CreateCommand();
                 insert.Transaction = tx;
                 insert.CommandText =
-                    "INSERT OR IGNORE INTO ai_pinned_messages(contact_id, message_id) VALUES($cid, $mid);";
+                    """
+                    INSERT OR IGNORE INTO ai_pinned_messages(account_id, contact_id, message_id)
+                    VALUES($accountId, $cid, $mid);
+                    """;
+                insert.Parameters.AddWithValue("$accountId", accountId);
                 insert.Parameters.AddWithValue("$cid", contactId);
                 insert.Parameters.AddWithValue("$mid", messageId);
                 insert.ExecuteNonQuery();
@@ -677,6 +770,116 @@ public sealed class SqliteStore
             tx.Commit();
         }, cancellationToken);
     }
+
+    private static void MigrateOverridesToV5(SqliteConnection connection)
+    {
+        if (!TableExists(connection, "ai_contact_overrides"))
+        {
+            using var create = connection.CreateCommand();
+            create.CommandText =
+                """
+                CREATE TABLE ai_contact_overrides (
+                    account_id TEXT NOT NULL,
+                    contact_id TEXT NOT NULL,
+                    json TEXT NOT NULL,
+                    PRIMARY KEY(account_id, contact_id)
+                );
+                """;
+            create.ExecuteNonQuery();
+            return;
+        }
+
+        if (TableHasColumn(connection, "ai_contact_overrides", "account_id"))
+        {
+            return;
+        }
+
+        using var migrate = connection.CreateCommand();
+        migrate.CommandText =
+            """
+            CREATE TABLE ai_contact_overrides_v5 (
+                account_id TEXT NOT NULL,
+                contact_id TEXT NOT NULL,
+                json TEXT NOT NULL,
+                PRIMARY KEY(account_id, contact_id)
+            );
+            INSERT INTO ai_contact_overrides_v5(account_id, contact_id, json)
+            SELECT 'legacy', contact_id, json FROM ai_contact_overrides;
+            DROP TABLE ai_contact_overrides;
+            ALTER TABLE ai_contact_overrides_v5 RENAME TO ai_contact_overrides;
+            """;
+        migrate.ExecuteNonQuery();
+    }
+
+    private static void MigratePinsToV5(SqliteConnection connection)
+    {
+        if (!TableExists(connection, "ai_pinned_messages"))
+        {
+            using var create = connection.CreateCommand();
+            create.CommandText =
+                """
+                CREATE TABLE ai_pinned_messages (
+                    account_id TEXT NOT NULL,
+                    contact_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    PRIMARY KEY(account_id, contact_id, message_id)
+                );
+                """;
+            create.ExecuteNonQuery();
+            return;
+        }
+
+        if (TableHasColumn(connection, "ai_pinned_messages", "account_id"))
+        {
+            return;
+        }
+
+        using var migrate = connection.CreateCommand();
+        migrate.CommandText =
+            """
+            CREATE TABLE ai_pinned_messages_v5 (
+                account_id TEXT NOT NULL,
+                contact_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                PRIMARY KEY(account_id, contact_id, message_id)
+            );
+            INSERT INTO ai_pinned_messages_v5(account_id, contact_id, message_id)
+            SELECT 'legacy', contact_id, message_id FROM ai_pinned_messages;
+            DROP TABLE ai_pinned_messages;
+            ALTER TABLE ai_pinned_messages_v5 RENAME TO ai_pinned_messages;
+            """;
+        migrate.ExecuteNonQuery();
+    }
+
+    private static bool TableExists(SqliteConnection connection, string tableName)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = $name LIMIT 1;";
+        command.Parameters.AddWithValue("$name", tableName);
+        return command.ExecuteScalar() is not null;
+    }
+
+    private static bool TableHasColumn(SqliteConnection connection, string table, string column)
+    {
+        using var check = connection.CreateCommand();
+        check.CommandText = $"PRAGMA table_info({table});";
+        using var reader = check.ExecuteReader();
+        while (reader.Read())
+        {
+            if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public static string NormalizeAccountId(string? accountId)
+        => string.IsNullOrWhiteSpace(accountId) ? LegacyAccountId : accountId.Trim();
+
+    private static string CompositeKey(string accountId, string contactId)
+        => $"{accountId}::{contactId}";
 
     private static int ReadSchemaVersion(SqliteConnection connection)
     {

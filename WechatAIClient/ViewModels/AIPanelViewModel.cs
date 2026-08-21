@@ -21,10 +21,12 @@ public partial class AIPanelViewModel : ViewModelBase
     private readonly SqliteStore _sqlite;
     private readonly ILogger<AIPanelViewModel> _logger;
     private string? _boundContactId;
+    private string? _boundAccountId;
     private bool _suppressPersist;
     private AIContextBuildResult? _lastBuildResult;
     private IReadOnlyList<ChatMessage> _lastPreviewSource = Array.Empty<ChatMessage>();
     private string _lastPreviewContactId = "";
+    private string _lastPreviewAccountId = "";
     private string _lastPreviewContactName = "";
     private bool _lastPreviewIsGroup;
     private EventHandler? _statusHandler;
@@ -217,9 +219,12 @@ public partial class AIPanelViewModel : ViewModelBase
         AutoPausedUntil = await _aiSettings.GetAutoPausedUntilAsync();
     }
 
-    public async Task BindContactAsync(string? contactId)
+    public async Task BindContactAsync(string? contactId, string? accountId = null)
     {
         _boundContactId = string.IsNullOrWhiteSpace(contactId) ? null : contactId;
+        _boundAccountId = string.IsNullOrWhiteSpace(contactId)
+            ? null
+            : SqliteStore.NormalizeAccountId(accountId);
         TemporarilyExcludedMessageIds.Clear();
         _suppressPersist = true;
         try
@@ -229,6 +234,7 @@ public partial class AIPanelViewModel : ViewModelBase
                 var global = await _aiSettings.GetGlobalAsync();
                 ApplyEffective(new EffectiveAISettings
                 {
+                    AccountId = string.Empty,
                     ContactId = string.Empty,
                     IsUsingOverride = false,
                     ReplyMode = global.ReplyMode,
@@ -242,9 +248,9 @@ public partial class AIPanelViewModel : ViewModelBase
             }
             else
             {
-                var effective = await _aiSettings.GetEffectiveAsync(_boundContactId);
+                var effective = await _aiSettings.GetEffectiveAsync(_boundAccountId!, _boundContactId);
                 ApplyEffective(effective);
-                var pins = await _aiSettings.GetPinnedIdsAsync(_boundContactId);
+                var pins = await _aiSettings.GetPinnedIdsAsync(_boundAccountId!, _boundContactId);
                 PinnedCountText = $"置顶 {pins.Count}";
             }
         }
@@ -256,6 +262,7 @@ public partial class AIPanelViewModel : ViewModelBase
 
     public EffectiveAISettings CaptureEffectiveSnapshot() => new()
     {
+        AccountId = _boundAccountId ?? string.Empty,
         ContactId = _boundContactId ?? string.Empty,
         IsUsingOverride = IsUsingContactOverride,
         ReplyMode = ReplyMode,
@@ -271,14 +278,16 @@ public partial class AIPanelViewModel : ViewModelBase
         IReadOnlyList<ChatMessage> messages,
         string contactId,
         string contactName,
-        bool isGroup)
+        bool isGroup,
+        string? accountId = null)
     {
         _lastPreviewSource = messages.ToList();
         _lastPreviewContactId = contactId;
+        _lastPreviewAccountId = SqliteStore.NormalizeAccountId(accountId);
         _lastPreviewContactName = contactName;
         _lastPreviewIsGroup = isGroup;
 
-        var pins = await _aiSettings.GetPinnedIdsAsync(contactId);
+        var pins = await _aiSettings.GetPinnedIdsAsync(_lastPreviewAccountId, contactId);
         var excluded = new HashSet<string>(TemporarilyExcludedMessageIds, StringComparer.Ordinal);
 
         AIContextBuildInput MakeInput(HashSet<string>? tempExclude) => new()
@@ -485,8 +494,10 @@ public partial class AIPanelViewModel : ViewModelBase
             return;
         }
 
-        await _aiSettings.ClearOverrideAsync(_boundContactId);
-        await BindContactAsync(_boundContactId);
+        await _aiSettings.ClearOverrideAsync(
+            _boundAccountId ?? SqliteStore.LegacyAccountId,
+            _boundContactId);
+        await BindContactAsync(_boundContactId, _boundAccountId);
         await _toast.ShowAsync("已恢复全局默认");
     }
 
@@ -591,6 +602,7 @@ public partial class AIPanelViewModel : ViewModelBase
     public Task<string?> GenerateReplyAsync(IReadOnlyList<ChatMessage> messages, string contactName)
         => GenerateForContactAsync(new AIGenerationRequest
         {
+            AccountId = _boundAccountId ?? SqliteStore.LegacyAccountId,
             ContactId = _boundContactId ?? string.Empty,
             ContactName = contactName,
             ContextSnapshot = messages.ToList(),
@@ -605,6 +617,7 @@ public partial class AIPanelViewModel : ViewModelBase
     public async Task<AIGenerationResult?> GenerateForContactDetailedAsync(AIGenerationRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
+        request.AccountId = SqliteStore.NormalizeAccountId(request.AccountId);
 
         if (ReplyMode == AIReplyMode.Off)
         {
@@ -638,7 +651,7 @@ public partial class AIPanelViewModel : ViewModelBase
         if ((request.PinnedMessageIds is null || request.PinnedMessageIds.Count == 0)
             && !string.IsNullOrWhiteSpace(request.ContactId))
         {
-            request.PinnedMessageIds = await _aiSettings.GetPinnedIdsAsync(request.ContactId);
+            request.PinnedMessageIds = await _aiSettings.GetPinnedIdsAsync(request.AccountId, request.ContactId);
         }
 
         if (TemporarilyExcludedMessageIds.Count > 0)
@@ -723,6 +736,8 @@ public partial class AIPanelViewModel : ViewModelBase
                 Content = result.Content,
                 ContactName = request.ContactName,
                 ContactId = request.ContactId,
+                AccountId = request.AccountId,
+                AccountName = string.Empty,
                 Model = result.Model ?? _aiService.ModelName,
                 RequestId = result.RequestId,
                 ContextSummary = result.ContextSummary
@@ -852,7 +867,8 @@ public partial class AIPanelViewModel : ViewModelBase
             _lastPreviewSource,
             _lastPreviewContactId,
             _lastPreviewContactName,
-            _lastPreviewIsGroup);
+            _lastPreviewIsGroup,
+            _lastPreviewAccountId);
     }
 
     private void ApplyEffective(EffectiveAISettings effective)
@@ -880,6 +896,7 @@ public partial class AIPanelViewModel : ViewModelBase
             {
                 var ov = new AIContactOverride
                 {
+                    AccountId = _boundAccountId ?? SqliteStore.LegacyAccountId,
                     ContactId = _boundContactId,
                     UseOverride = true,
                     ReplyMode = ReplyMode,
@@ -918,8 +935,12 @@ public partial class AIPanelViewModel : ViewModelBase
         return new AIGenerationRequest
         {
             GenerationId = Guid.NewGuid().ToString("N"),
+            AccountId = last.AccountId,
             ContactId = last.ContactId,
             ContactName = last.ContactName,
+            TriggerAccountId = last.TriggerAccountId,
+            TriggerConversationId = last.TriggerConversationId,
+            TriggerMessageId = last.TriggerMessageId,
             ContextSnapshot = last.ContextSnapshot.ToList(),
             ContextLength = last.ContextLength,
             ReplyMode = last.ReplyMode,

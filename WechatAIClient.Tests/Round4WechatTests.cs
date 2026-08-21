@@ -12,6 +12,25 @@ public class Round4WechatTests
     private static RealWechatService CreateReal(FakeWechatBridgeClient bridge)
         => new(bridge, NullLogger<RealWechatService>.Instance);
 
+    private static MultiAccountWechatService CreateMultiAccount()
+    {
+        var settings = new FakeSettings();
+        var media = new WechatAIClient.Services.Media.MediaCacheService(
+            NullLogger<WechatAIClient.Services.Media.MediaCacheService>.Instance);
+        var manager = new WechatAccountManager(
+            settings,
+            new StubHttpClientFactory(),
+            NullLoggerFactory.Instance,
+            new WechatAIClient.Services.Weixin.WechatCallbackParser(),
+            media);
+        return new MultiAccountWechatService(manager, NullLogger<MultiAccountWechatService>.Instance);
+    }
+
+    private sealed class StubHttpClientFactory : System.Net.Http.IHttpClientFactory
+    {
+        public System.Net.Http.HttpClient CreateClient(string name) => new();
+    }
+
     private static BridgeMessage Remote(
         string conv,
         string id,
@@ -169,7 +188,7 @@ public class Round4WechatTests
         bridge.SetState(WechatConnectionState.Connected);
         bridge.ForceSendFail = true;
         var real = CreateReal(bridge);
-        var chat2 = new ChatViewModel(real, new FakeFilePicker(), new FakeToast(), new FakeAISettings(), NullLogger<ChatViewModel>.Instance);
+        var chat2 = new ChatViewModel(real, new FakeFilePicker(), new FakeToast(), new FakeAISettings(), new ConversationDraftStore(), NullLogger<ChatViewModel>.Instance);
         bridge.SeedContact(new BridgeContact("c9", "测", false, null, null, DateTime.Now));
         var contact = (await real.GetContactsAsync()).First();
         await chat2.LoadContactAsync(contact);
@@ -404,9 +423,7 @@ public class Round4WechatTests
     {
         var settings = new FakeSettings();
         var mock = new MockWechatService();
-        var bridge = new FakeWechatBridgeClient();
-        bridge.SetState(WechatConnectionState.Connected);
-        var real = CreateReal(bridge);
+        var real = CreateMultiAccount();
         var routing = new RoutingWechatService(mock, real, settings, NullLogger<RoutingWechatService>.Instance);
         await routing.SwitchProviderAsync(WechatProviderKind.Mock);
         Assert.Equal(WechatProviderKind.Mock, routing.ActiveProvider);

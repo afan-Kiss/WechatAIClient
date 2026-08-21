@@ -67,8 +67,44 @@
                               ContentPadding="12"
                               Margin="0,0,8,0"
                               HorizontalAlignment="Left">
-            <Grid RowDefinitions="Auto,Auto,*,Auto,Auto" DataContext="{Binding ContactList}">
-              <Grid ColumnDefinitions="*,Auto">
+            <Grid RowDefinitions="Auto,Auto,Auto,*,Auto,Auto">
+              <Button Classes="glass-button"
+                      HorizontalAlignment="Stretch"
+                      Margin="0,0,0,8"
+                      Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).ToggleAccountMenuCommand}"
+                      Content="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).AccountSwitcherText}" />
+              <Popup IsOpen="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).IsAccountMenuOpen, Mode=TwoWay}"
+                     Placement="Bottom"
+                     PlacementTarget="{Binding $parent}"
+                     IsLightDismissEnabled="True">
+                <Border Background="{DynamicResource PanelElevatedBrush}"
+                        BorderBrush="{DynamicResource GlassBorderBrush}"
+                        BorderThickness="1"
+                        CornerRadius="10"
+                        Padding="6"
+                        MinWidth="200">
+                  <ItemsControl ItemsSource="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).AccountMenuItems}">
+                    <ItemsControl.ItemTemplate>
+                      <DataTemplate x:DataType="vm:AccountMenuItem">
+                        <Button Classes="segment"
+                                HorizontalAlignment="Stretch"
+                                Margin="0,2"
+                                Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).SelectAccountMenuItemCommand}"
+                                CommandParameter="{Binding}">
+                          <StackPanel>
+                            <TextBlock Text="{Binding Title}" FontWeight="SemiBold" />
+                            <TextBlock Text="{Binding Subtitle}"
+                                       FontSize="11"
+                                       Foreground="{DynamicResource TextMutedBrush}" />
+                          </StackPanel>
+                        </Button>
+                      </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                  </ItemsControl>
+                </Border>
+              </Popup>
+
+              <Grid Grid.Row="1" ColumnDefinitions="*,Auto" DataContext="{Binding ContactList}">
                 <TextBox Classes="search-box"
                          Text="{Binding SearchText}"
                          PlaceholderText="搜索联系人或群聊"
@@ -90,8 +126,9 @@
                 </Border>
               </Grid>
 
-              <Border Grid.Row="1" Margin="0,12,0,12" Padding="4" CornerRadius="10"
-                      Background="{DynamicResource InputBackgroundBrush}">
+              <Border Grid.Row="2" Margin="0,12,0,12" Padding="4" CornerRadius="10"
+                      Background="{DynamicResource InputBackgroundBrush}"
+                      DataContext="{Binding ContactList}">
                 <Grid ColumnDefinitions="*,*,*">
                   <Button Classes="segment" Classes.active="{Binding IsRecentTab}"
                           Command="{Binding SelectTabCommand}" CommandParameter="0"
@@ -105,8 +142,9 @@
                 </Grid>
               </Border>
 
-              <ListBox Grid.Row="2"
+              <ListBox Grid.Row="3"
                        Classes="contact-list"
+                       DataContext="{Binding ContactList}"
                        ItemsSource="{Binding VisibleContacts}"
                        SelectedItem="{Binding SelectedContact}">
                 <ListBox.ItemsPanel>
@@ -121,17 +159,24 @@
                         <controls:Avatar Grid.RowSpan="2"
                                          Initials="{Binding AvatarInitials}"
                                          AvatarBackground="{Binding AvatarColor, Converter={StaticResource StringToBrushConverter}}"
+                                         ImagePath="{Binding AvatarLocalPath}"
                                          Size="44"
                                          Margin="0,0,10,0"
                                          VerticalAlignment="Center" />
-                        <TextBlock Grid.Column="1"
-                                   Text="{Binding Name}"
-                                   Foreground="{DynamicResource TextBrush}"
-                                   FontWeight="SemiBold"
-                                   FontSize="14"
-                                   MinWidth="0"
-                                   TextTrimming="CharacterEllipsis"
-                                   TextWrapping="NoWrap" />
+                        <StackPanel Grid.Column="1" Spacing="2" MinWidth="0">
+                          <TextBlock Text="{Binding Name}"
+                                     Foreground="{DynamicResource TextBrush}"
+                                     FontWeight="SemiBold"
+                                     FontSize="14"
+                                     MinWidth="0"
+                                     TextTrimming="CharacterEllipsis"
+                                     TextWrapping="NoWrap" />
+                          <TextBlock Text="{Binding AccountDisplayName}"
+                                     Foreground="{DynamicResource TextMutedBrush}"
+                                     FontSize="10"
+                                     TextTrimming="CharacterEllipsis"
+                                     IsVisible="{Binding AccountDisplayName, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                        </StackPanel>
                         <TextBlock Grid.Column="2"
                                    Text="{Binding LastMessageTime, Converter={StaticResource TimeDisplayConverter}}"
                                    Foreground="{DynamicResource TextMutedBrush}"
@@ -170,7 +215,7 @@
               </ListBox>
 
               <!-- WeChat connection status -->
-              <Border Grid.Row="3"
+              <Border Grid.Row="4"
                       Margin="0,8,0,0"
                       Padding="8,6"
                       CornerRadius="10"
@@ -192,7 +237,7 @@
               </Border>
 
               <!-- Bottom nav: bind to MainWindow VM (not ContactList) -->
-              <Border Grid.Row="4"
+              <Border Grid.Row="5"
                       Margin="0,10,0,0"
                       Padding="6"
                       CornerRadius="12"
@@ -380,25 +425,90 @@
                                     </Border>
 
                                     <Border IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=Image}"
-                                            MaxHeight="240"
+                                            MaxWidth="320"
+                                            MaxHeight="300"
                                             CornerRadius="10"
                                             ClipToBounds="True"
-                                            Background="{DynamicResource AccentGradientBrush}">
+                                            Background="{DynamicResource QuoteBackgroundBrush}">
                                       <Panel>
-                                        <TextBlock Text="🖼 图片预览"
-                                                   Foreground="White"
+                                        <TextBlock Text="图片加载中…"
+                                                   Foreground="{DynamicResource TextMutedBrush}"
                                                    HorizontalAlignment="Center"
                                                    VerticalAlignment="Center"
-                                                   Margin="24" />
-                                        <Image Source="{Binding ImageUrl}"
-                                               MaxHeight="240"
+                                                   Margin="24"
+                                                   IsVisible="{Binding IsMediaLoading}" />
+                                        <StackPanel HorizontalAlignment="Center"
+                                                    VerticalAlignment="Center"
+                                                    Spacing="6"
+                                                    Margin="16"
+                                                    IsVisible="{Binding IsMediaFailed}">
+                                          <TextBlock Text="图片加载失败"
+                                                     Foreground="{DynamicResource TextMutedBrush}"
+                                                     HorizontalAlignment="Center" />
+                                          <TextBlock Text="{Binding MediaError}"
+                                                     FontSize="11"
+                                                     Foreground="{DynamicResource TextMutedBrush}"
+                                                     TextWrapping="Wrap"
+                                                     MaxWidth="200"
+                                                     HorizontalAlignment="Center" />
+                                        </StackPanel>
+                                        <Image Source="{Binding LocalPath}"
+                                               MaxWidth="320"
+                                               MaxHeight="300"
                                                Stretch="Uniform"
                                                HorizontalAlignment="Center"
-                                               VerticalAlignment="Center" />
+                                               VerticalAlignment="Center"
+                                               IsVisible="{Binding IsMediaLoaded}" />
+                                        <Image Source="{Binding ImageUrl}"
+                                               MaxWidth="320"
+                                               MaxHeight="300"
+                                               Stretch="Uniform"
+                                               HorizontalAlignment="Center"
+                                               VerticalAlignment="Center"
+                                               IsVisible="{Binding IsMediaLoaded}" />
                                       </Panel>
                                     </Border>
 
-                                    <Border IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=File}"
+                                    <Border IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=Emoji}"
+                                            MaxWidth="160"
+                                            MaxHeight="160"
+                                            CornerRadius="8">
+                                      <Panel>
+                                        <TextBlock Text="【表情消息】"
+                                                   IsVisible="{Binding IsMediaPlaceholder}"
+                                                   Foreground="{DynamicResource TextSecondaryBrush}"
+                                                   Margin="8" />
+                                        <Image Source="{Binding LocalPath}"
+                                               MaxWidth="160"
+                                               MaxHeight="160"
+                                               Stretch="Uniform"
+                                               IsVisible="{Binding IsMediaLoaded}" />
+                                        <Image Source="{Binding EmojiUrl}"
+                                               MaxWidth="160"
+                                               MaxHeight="160"
+                                               Stretch="Uniform"
+                                               IsVisible="{Binding IsMediaLoaded}" />
+                                      </Panel>
+                                    </Border>
+
+                                    <TextBlock Text="{Binding Content}"
+                                               TextWrapping="Wrap"
+                                               FontSize="14"
+                                               IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=File}" />
+                                    <TextBlock Text="{Binding Content}"
+                                               TextWrapping="Wrap"
+                                               FontSize="14"
+                                               IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=Video}" />
+                                    <TextBlock Text="{Binding Content}"
+                                               TextWrapping="Wrap"
+                                               FontSize="14"
+                                               IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=Voice}" />
+                                    <TextBlock Text="{Binding Content}"
+                                               TextWrapping="Wrap"
+                                               FontSize="14"
+                                               IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=Unknown}" />
+
+                                    <Border IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=FileLegacyHidden}"
                                             Background="{DynamicResource QuoteBackgroundBrush}"
                                             CornerRadius="10"
                                             Padding="12"

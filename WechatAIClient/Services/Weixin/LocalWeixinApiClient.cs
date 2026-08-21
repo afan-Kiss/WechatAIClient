@@ -42,6 +42,7 @@ public sealed class LocalWeixinApiClient : ILocalWeixinApiClient
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly ILogger<LocalWeixinApiClient> _logger;
     private string _baseUrl = DefaultBaseUrl;
+    private bool _baseUrlSet;
 
     public LocalWeixinApiClient(IHttpClientFactory httpClientFactory, ILogger<LocalWeixinApiClient> logger)
     {
@@ -49,10 +50,20 @@ public sealed class LocalWeixinApiClient : ILocalWeixinApiClient
         _logger = logger;
     }
 
+    /// <summary>Base URL for this client instance. Settable once (per-session clients).</summary>
     public string BaseUrl
     {
         get => _baseUrl;
-        set => _baseUrl = string.IsNullOrWhiteSpace(value) ? DefaultBaseUrl : value.TrimEnd('/');
+        set
+        {
+            if (_baseUrlSet)
+            {
+                return;
+            }
+
+            _baseUrl = string.IsNullOrWhiteSpace(value) ? DefaultBaseUrl : value.TrimEnd('/');
+            _baseUrlSet = true;
+        }
     }
 
     public async Task<bool> IsApiReachableAsync(CancellationToken cancellationToken = default)

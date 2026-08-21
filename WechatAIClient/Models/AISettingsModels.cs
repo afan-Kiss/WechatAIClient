@@ -13,6 +13,7 @@ public sealed class AIGlobalSettings
 
 public sealed class AIContactOverride
 {
+    public string AccountId { get; set; } = "";
     public string ContactId { get; set; } = "";
     public bool UseOverride { get; set; }
     public AIReplyMode? ReplyMode { get; set; }
@@ -26,6 +27,7 @@ public sealed class AIContactOverride
 
 public sealed class EffectiveAISettings
 {
+    public string AccountId { get; set; } = "";
     public string ContactId { get; set; } = "";
     public bool IsUsingOverride { get; set; }
     public AIReplyMode ReplyMode { get; set; }

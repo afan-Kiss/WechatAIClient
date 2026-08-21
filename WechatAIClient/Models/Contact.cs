@@ -6,6 +6,13 @@ public partial class Contact : ObservableObject
 {
     public string Id { get; set; } = string.Empty;
 
+    /// <summary>Owning WeChat account wxid / AccountId.</summary>
+    public string AccountId { get; set; } = string.Empty;
+
+    public string? AccountDisplayName { get; set; }
+
+    public ConversationKey Key => new(AccountId, Id);
+
     [ObservableProperty]
     private string _name = string.Empty;
 
@@ -14,6 +21,15 @@ public partial class Contact : ObservableObject
 
     [ObservableProperty]
     private string _avatarInitials = "?";
+
+    [ObservableProperty]
+    private string? _avatarUrl;
+
+    [ObservableProperty]
+    private string? _avatarLocalPath;
+
+    [ObservableProperty]
+    private AvatarLoadState _avatarLoadState;
 
     [ObservableProperty]
     private ContactType _type = ContactType.Friend;
@@ -25,7 +41,7 @@ public partial class Contact : ObservableObject
     private string _lastSender = string.Empty;
 
     [ObservableProperty]
-    private DateTime _lastMessageTime = DateTime.Now;
+    private DateTime _lastMessageTime = DateTime.MinValue;
 
     [ObservableProperty]
     private bool _hasLastActivity;
