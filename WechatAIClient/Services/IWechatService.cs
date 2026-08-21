@@ -30,4 +30,11 @@ public interface IWechatService
         string contactId,
         string content,
         CancellationToken cancellationToken = default);
+
+    Task SimulateIncomingMessageAsync(
+        string contactId,
+        string content,
+        bool mentionsMe,
+        bool quotesMe,
+        CancellationToken cancellationToken = default);
 }

@@ -110,6 +110,8 @@ public partial class App : Application
         services.AddSingleton<IFilePickerService, AvaloniaFilePickerService>();
         services.AddSingleton<IWechatService, MockWechatService>();
         services.AddSingleton<IAIService, MockAIService>();
+        services.AddSingleton<IAIContextBuilder, AIContextBuilder>();
+        services.AddSingleton<IAISettingsService, AISettingsService>();
         services.AddSingleton<AIOrchestrator>();
         services.AddSingleton<ContactListViewModel>();
         services.AddSingleton<ChatViewModel>();

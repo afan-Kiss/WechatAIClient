@@ -9,6 +9,7 @@ public sealed class ChatMessage
     public string SenderInitials { get; set; } = "?";
     public bool IsSelf { get; set; }
     public bool IsFromAi { get; set; }
+    public MessageSource Source { get; set; } = MessageSource.RemoteUser;
     public MessageType Type { get; set; } = MessageType.Text;
     public string Content { get; set; } = string.Empty;
     public string? ImageUrl { get; set; }
@@ -19,4 +20,6 @@ public sealed class ChatMessage
     public DateTime Timestamp { get; set; } = DateTime.Now;
     public bool ShowTimeSeparator { get; set; }
     public string? TimeSeparatorText { get; set; }
+    public bool MentionsMe { get; set; }
+    public bool QuotesMe { get; set; }
 }

@@ -6,19 +6,28 @@ namespace WechatAIClient.Services;
 public sealed class AIOrchestrator
 {
     private readonly IAIService _aiService;
+    private readonly IAIContextBuilder _contextBuilder;
     private readonly ILogger<AIOrchestrator> _logger;
     private readonly object _gate = new();
     private CancellationTokenSource? _cts;
 
-    public AIOrchestrator(IAIService aiService, ILogger<AIOrchestrator> logger)
+    public AIOrchestrator(
+        IAIService aiService,
+        IAIContextBuilder contextBuilder,
+        ILogger<AIOrchestrator> logger)
     {
         _aiService = aiService;
+        _contextBuilder = contextBuilder;
         _logger = logger;
     }
 
     public AIGenerationRequest? LastRequest { get; private set; }
+    public AIContextBuildResult? LastBuildResult { get; private set; }
+    public AIRequest? LastAiRequest { get; private set; }
 
-    public void CancelAll()
+    public void CancelAll() => CancelCurrentGeneration();
+
+    public void CancelCurrentGeneration()
     {
         lock (_gate)
         {
@@ -55,17 +64,44 @@ public sealed class AIOrchestrator
 
         try
         {
-            var context = request.ContextSnapshot
-                .TakeLast(Math.Max(1, request.ContextLength))
-                .ToList();
+            var buildInput = new AIContextBuildInput
+            {
+                ContactId = request.ContactId,
+                ContactName = request.ContactName,
+                IsGroup = request.IsGroup,
+                Messages = request.ContextSnapshot,
+                ContextCount = Math.Max(1, request.ContextLength),
+                IncludeOwnMessages = request.IncludeOwnMessages,
+                PinnedMessageIds = request.PinnedMessageIds,
+                TemporaryInstruction = request.TemporaryInstruction,
+                ReplyStyle = request.ReplyStyle,
+                ReplyLength = request.ReplyLength,
+                TokenBudget = request.TokenBudget > 0 ? request.TokenBudget : 3500,
+                TemporarilyExcludedMessageIds = request.TemporarilyExcludedMessageIds
+            };
 
-            var content = await _aiService.GenerateReplyAsync(context, token);
-            if (token.IsCancellationRequested || string.IsNullOrEmpty(content))
+            var buildResult = _contextBuilder.Build(buildInput);
+            LastBuildResult = buildResult;
+
+            var aiRequest = new AIRequest
+            {
+                ContactId = request.ContactId,
+                GenerationId = request.GenerationId,
+                Messages = buildResult.Messages,
+                Style = request.ReplyStyle,
+                Length = request.ReplyLength,
+                TemporaryInstruction = request.TemporaryInstruction,
+                ContextMeta = buildResult
+            };
+            LastAiRequest = aiRequest;
+
+            var response = await _aiService.GenerateAsync(aiRequest, token);
+            if (token.IsCancellationRequested || response is null || string.IsNullOrEmpty(response.Content))
             {
                 return null;
             }
 
-            await AnimateTypingAsync(content, onTypingChunk, token);
+            await AnimateTypingAsync(response.Content, onTypingChunk, token);
             if (token.IsCancellationRequested)
             {
                 return null;
@@ -75,7 +111,9 @@ public sealed class AIOrchestrator
             {
                 GenerationId = request.GenerationId,
                 ContactId = request.ContactId,
-                Content = content
+                Content = response.Content,
+                DraftRevisionAtStart = request.DraftRevisionAtStart,
+                ContextSummary = buildResult.SummaryText
             };
         }
         catch (OperationCanceledException)

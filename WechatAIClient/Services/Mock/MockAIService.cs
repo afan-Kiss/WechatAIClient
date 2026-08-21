@@ -32,20 +32,53 @@ public sealed class MockAIService : IAIService
         return Task.CompletedTask;
     }
 
-    public async Task<string> GenerateReplyAsync(
-        IReadOnlyList<ChatMessage> context,
-        CancellationToken cancellationToken = default)
+    public async Task<AIResponse> GenerateAsync(AIRequest request, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(request);
+        cancellationToken.ThrowIfCancellationRequested();
+
         await Task.Delay(700, cancellationToken);
 
-        var seed = context.Count == 0
-            ? Random.Shared.Next()
-            : Math.Abs(context[^1].Content.GetHashCode(StringComparison.Ordinal));
-        var reply = _templates[seed % _templates.Length];
+        var history = request.Messages?
+            .Where(m => !string.Equals(m.Role, "system", StringComparison.OrdinalIgnoreCase))
+            .ToList() ?? [];
 
-        // Chunk-friendly pause so orchestrator typing animation stays responsive to cancel.
+        var seedContent = history.Count == 0
+            ? string.Empty
+            : history[^1].Content;
+        var seed = string.IsNullOrEmpty(seedContent)
+            ? Random.Shared.Next()
+            : Math.Abs(seedContent.GetHashCode(StringComparison.Ordinal));
+
+        var reply = _templates[seed % _templates.Length];
+        var styleHint = request.Style switch
+        {
+            ReplyStyle.Concise => "（简洁）",
+            ReplyStyle.Formal => "（正式）",
+            ReplyStyle.Humorous => "（轻松）",
+            _ => string.Empty
+        };
+        if (!string.IsNullOrEmpty(styleHint))
+        {
+            reply = styleHint + reply;
+        }
+
+        if (!string.IsNullOrWhiteSpace(request.TemporaryInstruction))
+        {
+            reply = $"[按指令] {reply}";
+        }
+
         await Task.Delay(120, cancellationToken);
-        _logger.LogInformation("Generated mock AI reply with {Count} context messages", context.Count);
-        return reply;
+        _logger.LogInformation(
+            "Generated mock AI reply with {Count} context messages for {ContactId}",
+            history.Count,
+            request.ContactId);
+
+        return new AIResponse
+        {
+            Content = reply,
+            GenerationId = request.GenerationId,
+            ContactId = request.ContactId
+        };
     }
 }

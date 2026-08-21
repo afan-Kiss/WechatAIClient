@@ -14,20 +14,26 @@ public partial class ChatViewModel : ViewModelBase
     private readonly IWechatService _wechatService;
     private readonly IFilePickerService _filePicker;
     private readonly IToastService _toast;
+    private readonly IAISettingsService _aiSettings;
     private readonly ILogger<ChatViewModel> _logger;
     private CancellationTokenSource? _loadCts;
     private int _loadVersion;
+    private int _draftRevision;
+    private bool _suppressDraftRevision;
     private EventHandler<MessageReceivedEventArgs>? _messageReceivedHandler;
+    private HashSet<string> _pinnedIds = new(StringComparer.Ordinal);
 
     public ChatViewModel(
         IWechatService wechatService,
         IFilePickerService filePicker,
         IToastService toast,
+        IAISettingsService aiSettings,
         ILogger<ChatViewModel> logger)
     {
         _wechatService = wechatService;
         _filePicker = filePicker;
         _toast = toast;
+        _aiSettings = aiSettings;
         _logger = logger;
 
         _messageReceivedHandler = OnMessageReceived;
@@ -35,6 +41,8 @@ public partial class ChatViewModel : ViewModelBase
     }
 
     public ObservableCollection<ChatMessage> Messages { get; } = [];
+
+    public int DraftRevision => _draftRevision;
 
     [ObservableProperty]
     private Contact? _currentContact;
@@ -89,6 +97,7 @@ public partial class ChatViewModel : ViewModelBase
         Messages.Clear();
         IsEmojiPickerOpen = false;
         NotifyCanSendChanged();
+        await RefreshPinsAsync(contactId);
 
         try
         {
@@ -114,6 +123,72 @@ public partial class ChatViewModel : ViewModelBase
         {
             _logger.LogError(ex, "Failed to load messages for {ContactId}", contactId);
         }
+    }
+
+    public void SetDraftFromAi(string text)
+    {
+        _suppressDraftRevision = true;
+        try
+        {
+            DraftText = text ?? string.Empty;
+        }
+        finally
+        {
+            _suppressDraftRevision = false;
+        }
+    }
+
+    public bool TryApplyAiDraft(string text, int expectedRevision)
+    {
+        if (_draftRevision != expectedRevision)
+        {
+            return false;
+        }
+
+        SetDraftFromAi(text);
+        return true;
+    }
+
+    public bool IsPinned(string? messageId)
+    {
+        if (string.IsNullOrWhiteSpace(messageId))
+        {
+            return false;
+        }
+
+        return _pinnedIds.Contains(messageId);
+    }
+
+    [RelayCommand]
+    private async Task PinMessageAsync(ChatMessage? message)
+    {
+        if (message is null || CurrentContact is null)
+        {
+            return;
+        }
+
+        var pinned = await _aiSettings.TogglePinAsync(CurrentContact.Id, message.Id);
+        await RefreshPinsAsync(CurrentContact.Id);
+        await _toast.ShowAsync(pinned ? "已置顶" : "已取消置顶");
+        OnPropertyChanged(nameof(Messages));
+    }
+
+    [RelayCommand]
+    private async Task UnpinMessageAsync(ChatMessage? message)
+    {
+        if (message is null || CurrentContact is null)
+        {
+            return;
+        }
+
+        if (!IsPinned(message.Id))
+        {
+            return;
+        }
+
+        await _aiSettings.TogglePinAsync(CurrentContact.Id, message.Id);
+        await RefreshPinsAsync(CurrentContact.Id);
+        await _toast.ShowAsync("已取消置顶");
     }
 
     [RelayCommand(CanExecute = nameof(CanSend))]
@@ -297,9 +372,31 @@ public partial class ChatViewModel : ViewModelBase
         _loadCts = null;
     }
 
-    partial void OnDraftTextChanged(string value) => NotifyCanSendChanged();
+    partial void OnDraftTextChanged(string value)
+    {
+        if (!_suppressDraftRevision)
+        {
+            Interlocked.Increment(ref _draftRevision);
+        }
+
+        NotifyCanSendChanged();
+    }
 
     partial void OnCurrentContactChanged(Contact? value) => NotifyCanSendChanged();
+
+    private async Task RefreshPinsAsync(string contactId)
+    {
+        try
+        {
+            var pins = await _aiSettings.GetPinnedIdsAsync(contactId);
+            _pinnedIds = new HashSet<string>(pins, StringComparer.Ordinal);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to refresh pins for {ContactId}", contactId);
+            _pinnedIds = new HashSet<string>(StringComparer.Ordinal);
+        }
+    }
 
     private void NotifyCanSendChanged()
     {

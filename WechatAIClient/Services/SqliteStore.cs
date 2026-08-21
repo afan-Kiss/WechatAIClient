@@ -6,22 +6,38 @@ namespace WechatAIClient.Services;
 
 public sealed class SqliteStore
 {
-    private const int CurrentSchemaVersion = 2;
+    private const int CurrentSchemaVersion = 3;
     private readonly ILogger<SqliteStore> _logger;
     private readonly string _dbPath;
     private readonly object _gate = new();
     private readonly Dictionary<string, string> _memorySettings = new(StringComparer.Ordinal);
     private readonly List<AIReplyHistoryItem> _memoryHistory = [];
+    private string? _memoryGlobalJson;
+    private readonly Dictionary<string, string> _memoryOverrides = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, HashSet<string>> _memoryPins = new(StringComparer.Ordinal);
     private bool _useMemoryFallback;
 
-    public SqliteStore(ILogger<SqliteStore> logger)
+    public SqliteStore(ILogger<SqliteStore> logger, string? databasePath = null)
     {
         _logger = logger;
-        var appData = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "WechatAIClient");
-        Directory.CreateDirectory(appData);
-        _dbPath = Path.Combine(appData, "wechat-ai.db");
+        if (!string.IsNullOrWhiteSpace(databasePath))
+        {
+            var dir = Path.GetDirectoryName(databasePath);
+            if (!string.IsNullOrWhiteSpace(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            _dbPath = databasePath;
+        }
+        else
+        {
+            var appData = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "WechatAIClient");
+            Directory.CreateDirectory(appData);
+            _dbPath = Path.Combine(appData, "wechat-ai.db");
+        }
     }
 
     public string DatabasePath => _dbPath;
@@ -267,15 +283,288 @@ public sealed class SqliteStore
             using var bump = connection.CreateCommand();
             bump.CommandText = "UPDATE schema_version SET version = 2;";
             bump.ExecuteNonQuery();
+            version = 2;
+        }
+
+        if (version < 3)
+        {
+            try
+            {
+                using var v3 = connection.CreateCommand();
+                v3.CommandText =
+                    """
+                    CREATE TABLE IF NOT EXISTS ai_global_settings (
+                        id INTEGER PRIMARY KEY CHECK(id=1),
+                        json TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS ai_contact_overrides (
+                        contact_id TEXT PRIMARY KEY,
+                        json TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS ai_pinned_messages (
+                        contact_id TEXT NOT NULL,
+                        message_id TEXT NOT NULL,
+                        PRIMARY KEY(contact_id, message_id)
+                    );
+                    """;
+                v3.ExecuteNonQuery();
+
+                using var bump = connection.CreateCommand();
+                bump.CommandText = "UPDATE schema_version SET version = 3;";
+                bump.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to migrate SQLite schema to v3; continuing with defaults");
+            }
         }
 
         if (ReadSchemaVersion(connection) < CurrentSchemaVersion)
         {
-            using var sync = connection.CreateCommand();
-            sync.CommandText = "UPDATE schema_version SET version = $v;";
-            sync.Parameters.AddWithValue("$v", CurrentSchemaVersion);
-            sync.ExecuteNonQuery();
+            try
+            {
+                using var sync = connection.CreateCommand();
+                sync.CommandText = "UPDATE schema_version SET version = $v;";
+                sync.Parameters.AddWithValue("$v", CurrentSchemaVersion);
+                sync.ExecuteNonQuery();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to sync schema version to {Version}", CurrentSchemaVersion);
+            }
         }
+    }
+
+    public Task<string?> GetAiGlobalJsonAsync(CancellationToken cancellationToken = default)
+    {
+        if (_useMemoryFallback)
+        {
+            lock (_gate)
+            {
+                return Task.FromResult(_memoryGlobalJson);
+            }
+        }
+
+        return Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                using var connection = OpenConnection();
+                using var command = connection.CreateCommand();
+                command.CommandText = "SELECT json FROM ai_global_settings WHERE id = 1 LIMIT 1;";
+                return command.ExecuteScalar() as string;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "GetAiGlobalJson failed");
+                return null;
+            }
+        }, cancellationToken);
+    }
+
+    public Task SetAiGlobalJsonAsync(string json, CancellationToken cancellationToken = default)
+    {
+        json ??= "{}";
+        if (_useMemoryFallback)
+        {
+            lock (_gate)
+            {
+                _memoryGlobalJson = json;
+            }
+
+            return Task.CompletedTask;
+        }
+
+        return Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var connection = OpenConnection();
+            using var command = connection.CreateCommand();
+            command.CommandText =
+                """
+                INSERT INTO ai_global_settings(id, json) VALUES(1, $json)
+                ON CONFLICT(id) DO UPDATE SET json = excluded.json;
+                """;
+            command.Parameters.AddWithValue("$json", json);
+            command.ExecuteNonQuery();
+        }, cancellationToken);
+    }
+
+    public Task<string?> GetAiOverrideJsonAsync(string contactId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(contactId);
+        if (_useMemoryFallback)
+        {
+            lock (_gate)
+            {
+                return Task.FromResult(_memoryOverrides.TryGetValue(contactId, out var json) ? json : null);
+            }
+        }
+
+        return Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                using var connection = OpenConnection();
+                using var command = connection.CreateCommand();
+                command.CommandText = "SELECT json FROM ai_contact_overrides WHERE contact_id = $id LIMIT 1;";
+                command.Parameters.AddWithValue("$id", contactId);
+                return command.ExecuteScalar() as string;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "GetAiOverrideJson failed for {ContactId}", contactId);
+                return null;
+            }
+        }, cancellationToken);
+    }
+
+    public Task SetAiOverrideJsonAsync(string contactId, string json, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(contactId);
+        json ??= "{}";
+
+        if (_useMemoryFallback)
+        {
+            lock (_gate)
+            {
+                _memoryOverrides[contactId] = json;
+            }
+
+            return Task.CompletedTask;
+        }
+
+        return Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var connection = OpenConnection();
+            using var command = connection.CreateCommand();
+            command.CommandText =
+                """
+                INSERT INTO ai_contact_overrides(contact_id, json) VALUES($id, $json)
+                ON CONFLICT(contact_id) DO UPDATE SET json = excluded.json;
+                """;
+            command.Parameters.AddWithValue("$id", contactId);
+            command.Parameters.AddWithValue("$json", json);
+            command.ExecuteNonQuery();
+        }, cancellationToken);
+    }
+
+    public Task DeleteAiOverrideAsync(string contactId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(contactId);
+        if (_useMemoryFallback)
+        {
+            lock (_gate)
+            {
+                _memoryOverrides.Remove(contactId);
+            }
+
+            return Task.CompletedTask;
+        }
+
+        return Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var connection = OpenConnection();
+            using var command = connection.CreateCommand();
+            command.CommandText = "DELETE FROM ai_contact_overrides WHERE contact_id = $id;";
+            command.Parameters.AddWithValue("$id", contactId);
+            command.ExecuteNonQuery();
+        }, cancellationToken);
+    }
+
+    public Task<IReadOnlyList<string>> GetPinnedMessageIdsAsync(string contactId, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(contactId);
+        if (_useMemoryFallback)
+        {
+            lock (_gate)
+            {
+                if (_memoryPins.TryGetValue(contactId, out var set))
+                {
+                    return Task.FromResult<IReadOnlyList<string>>(set.ToList());
+                }
+
+                return Task.FromResult<IReadOnlyList<string>>(Array.Empty<string>());
+            }
+        }
+
+        return Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                using var connection = OpenConnection();
+                using var command = connection.CreateCommand();
+                command.CommandText =
+                    "SELECT message_id FROM ai_pinned_messages WHERE contact_id = $id;";
+                command.Parameters.AddWithValue("$id", contactId);
+                var list = new List<string>();
+                using var reader = command.ExecuteReader();
+                while (reader.Read())
+                {
+                    list.Add(reader.GetString(0));
+                }
+
+                return (IReadOnlyList<string>)list;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "GetPinnedMessageIds failed for {ContactId}", contactId);
+                return Array.Empty<string>();
+            }
+        }, cancellationToken);
+    }
+
+    public Task SetPinnedMessageIdsAsync(
+        string contactId,
+        IReadOnlyList<string> messageIds,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(contactId);
+        messageIds ??= Array.Empty<string>();
+
+        if (_useMemoryFallback)
+        {
+            lock (_gate)
+            {
+                _memoryPins[contactId] = new HashSet<string>(
+                    messageIds.Where(id => !string.IsNullOrWhiteSpace(id)).Take(8),
+                    StringComparer.Ordinal);
+            }
+
+            return Task.CompletedTask;
+        }
+
+        return Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var connection = OpenConnection();
+            using var tx = connection.BeginTransaction();
+            using (var del = connection.CreateCommand())
+            {
+                del.Transaction = tx;
+                del.CommandText = "DELETE FROM ai_pinned_messages WHERE contact_id = $id;";
+                del.Parameters.AddWithValue("$id", contactId);
+                del.ExecuteNonQuery();
+            }
+
+            foreach (var messageId in messageIds.Where(id => !string.IsNullOrWhiteSpace(id)).Take(8))
+            {
+                using var insert = connection.CreateCommand();
+                insert.Transaction = tx;
+                insert.CommandText =
+                    "INSERT OR IGNORE INTO ai_pinned_messages(contact_id, message_id) VALUES($cid, $mid);";
+                insert.Parameters.AddWithValue("$cid", contactId);
+                insert.Parameters.AddWithValue("$mid", messageId);
+                insert.ExecuteNonQuery();
+            }
+
+            tx.Commit();
+        }, cancellationToken);
     }
 
     private static int ReadSchemaVersion(SqliteConnection connection)

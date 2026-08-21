@@ -12,6 +12,7 @@ public partial class MainWindowViewModel : ViewModelBase
 {
     private readonly IThemeService _themeService;
     private readonly IWechatService _wechatService;
+    private readonly IAISettingsService _aiSettings;
     private readonly IToastService _toast;
     private readonly ILogger<MainWindowViewModel> _logger;
     private readonly Dictionary<string, CancellationTokenSource> _autoDebounce = new(StringComparer.Ordinal);
@@ -28,6 +29,7 @@ public partial class MainWindowViewModel : ViewModelBase
         AIPanelViewModel aiPanel,
         IThemeService themeService,
         IWechatService wechatService,
+        IAISettingsService aiSettings,
         IToastService toast,
         ILogger<MainWindowViewModel> logger)
     {
@@ -36,12 +38,16 @@ public partial class MainWindowViewModel : ViewModelBase
         AiPanel = aiPanel;
         _themeService = themeService;
         _wechatService = wechatService;
+        _aiSettings = aiSettings;
         _toast = toast;
         _logger = logger;
         SelectedThemeMode = themeService.CurrentMode;
 
         _contactSelectedHandler = (_, contact) =>
+        {
             Chat.LoadContactAsync(contact).SafeFireAndForget(_logger);
+            AiPanel.BindContactAsync(contact.Id).SafeFireAndForget(_logger);
+        };
         ContactList.ContactSelected += _contactSelectedHandler;
 
         _requestAiAssistHandler = (_, _) =>
@@ -125,6 +131,10 @@ public partial class MainWindowViewModel : ViewModelBase
             SelectedThemeMode = _themeService.CurrentMode;
             await ContactList.InitializeAsync();
             await AiPanel.InitializeAsync();
+            if (ContactList.SelectedContact is { } selected)
+            {
+                await AiPanel.BindContactAsync(selected.Id);
+            }
             // SelectedContact set during ContactList.Initialize fires ContactSelected -> LoadContactAsync.
             // Do not call Chat.LoadContactAsync again here.
         }
@@ -250,6 +260,27 @@ public partial class MainWindowViewModel : ViewModelBase
     }
 
     [RelayCommand]
+    private async Task OpenAiContextPreviewAsync()
+    {
+        if (Chat.CurrentContact is null)
+        {
+            await _toast.ShowAsync("请先选择会话");
+            return;
+        }
+
+        var contact = Chat.CurrentContact;
+        await AiPanel.RefreshContextPreviewAsync(
+            Chat.Messages.ToList(),
+            contact.Id,
+            contact.Name,
+            contact.Type == ContactType.Group);
+        AiPanel.IsContextPreviewOpen = true;
+    }
+
+    [RelayCommand]
+    private void CloseAiContextPreview() => AiPanel.IsContextPreviewOpen = false;
+
+    [RelayCommand]
     private async Task GenerateAiReplyAsync()
     {
         if (Chat.CurrentContact is null)
@@ -264,32 +295,58 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         var contact = Chat.CurrentContact;
+        var draftRevision = Chat.DraftRevision;
+        var pins = await _aiSettings.GetPinnedIdsAsync(contact.Id);
         var request = new AIGenerationRequest
         {
             ContactId = contact.Id,
             ContactName = contact.Name,
             ContextSnapshot = Chat.Messages.ToList(),
             ContextLength = AiPanel.ContextLength,
-            ReplyMode = AiPanel.ReplyMode
+            ReplyMode = AiPanel.ReplyMode,
+            IncludeOwnMessages = AiPanel.IncludeOwnMessages,
+            ReplyStyle = AiPanel.ReplyStyle,
+            ReplyLength = AiPanel.ReplyLength,
+            TemporaryInstruction = string.IsNullOrWhiteSpace(AiPanel.TemporaryInstruction)
+                ? null
+                : AiPanel.TemporaryInstruction,
+            PinnedMessageIds = pins,
+            DraftRevisionAtStart = draftRevision,
+            IsGroup = contact.Type == ContactType.Group
         };
 
-        var reply = await AiPanel.GenerateForContactAsync(request);
-        if (reply is null)
+        var result = await AiPanel.GenerateForContactDetailedAsync(request);
+        if (result is null)
         {
             return;
         }
 
         if (AiPanel.ReplyMode == AIReplyMode.Auto)
         {
-            await Chat.SendAsync(contact.Id, reply, isFromAi: true);
+            await Chat.SendAsync(contact.Id, result.Content, isFromAi: true);
         }
         else if (AiPanel.ReplyMode == AIReplyMode.ManualConfirm)
         {
-            if (Chat.CurrentContact?.Id == contact.Id)
-            {
-                Chat.DraftText = reply;
-            }
+            await ApplyManualConfirmResultAsync(contact.Id, result.Content, draftRevision);
         }
+    }
+
+    private async Task ApplyManualConfirmResultAsync(string contactId, string reply, int draftRevisionAtStart)
+    {
+        if (Chat.CurrentContact?.Id != contactId)
+        {
+            AiPanel.LatestGeneratedReply = reply;
+            return;
+        }
+
+        if (!Chat.TryApplyAiDraft(reply, draftRevisionAtStart))
+        {
+            AiPanel.LatestGeneratedReply = reply;
+            await _toast.ShowAsync("已生成新候选");
+            return;
+        }
+
+        AiPanel.LatestGeneratedReply = reply;
     }
 
     private void OnMessageReceived(object? sender, MessageReceivedEventArgs e)
@@ -299,9 +356,25 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
+        if (AiPanel.IsAutoPaused)
+        {
+            return;
+        }
+
         if (!AiPanel.AutoGenerateOnReceive)
         {
             return;
+        }
+
+        var contact = ContactList.FindContact(e.ContactId) ??
+                      (Chat.CurrentContact?.Id == e.ContactId ? Chat.CurrentContact : null);
+
+        if (contact?.Type == ContactType.Group)
+        {
+            if (!PassesGroupTrigger(AiPanel.GroupTriggerMode, e.Message))
+            {
+                return;
+            }
         }
 
         if (AiPanel.ReplyMode == AIReplyMode.Auto)
@@ -310,9 +383,21 @@ public partial class MainWindowViewModel : ViewModelBase
         }
         else if (AiPanel.ReplyMode == AIReplyMode.ManualConfirm)
         {
-            // Draft only — do not send.
             ScheduleAutoGenerate(e.ContactId, autoSend: false);
         }
+    }
+
+    private static bool PassesGroupTrigger(GroupTriggerMode mode, ChatMessage message)
+    {
+        return mode switch
+        {
+            GroupTriggerMode.Off => false,
+            GroupTriggerMode.AllMessages => true,
+            GroupTriggerMode.MentionMeOnly => message.MentionsMe,
+            GroupTriggerMode.QuoteMeOnly => message.QuotesMe,
+            GroupTriggerMode.MentionOrQuoteMe => message.MentionsMe || message.QuotesMe,
+            _ => true
+        };
     }
 
     private void ScheduleAutoGenerate(string contactId, bool autoSend)
@@ -333,8 +418,13 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         try
         {
-            await Task.Delay(400, cancellationToken);
+            await Task.Delay(1200, cancellationToken);
             if (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            if (AiPanel.IsAutoPaused)
             {
                 return;
             }
@@ -347,29 +437,49 @@ public partial class MainWindowViewModel : ViewModelBase
             }
 
             var contactName = contact?.Name ?? contactId;
+            var isGroup = contact?.Type == ContactType.Group;
             var replyMode = autoSend ? AIReplyMode.Auto : AIReplyMode.ManualConfirm;
+            var draftRevision = Chat.CurrentContact?.Id == contactId ? Chat.DraftRevision : (int?)null;
+            var pins = await _aiSettings.GetPinnedIdsAsync(contactId, cancellationToken);
+
+            // Refresh effective settings for this contact when auto-firing
+            var effective = await _aiSettings.GetEffectiveAsync(contactId, cancellationToken);
+
             var request = new AIGenerationRequest
             {
                 ContactId = contactId,
                 ContactName = contactName,
                 ContextSnapshot = messages.ToList(),
-                ContextLength = AiPanel.ContextLength,
-                ReplyMode = replyMode
+                ContextLength = effective.ContextCount,
+                ReplyMode = replyMode,
+                IncludeOwnMessages = effective.IncludeOwnMessages,
+                ReplyStyle = effective.ReplyStyle,
+                ReplyLength = effective.ReplyLength,
+                TemporaryInstruction = string.IsNullOrWhiteSpace(AiPanel.TemporaryInstruction)
+                    ? null
+                    : AiPanel.TemporaryInstruction,
+                PinnedMessageIds = pins,
+                DraftRevisionAtStart = draftRevision,
+                IsGroup = isGroup
             };
 
-            var reply = await AiPanel.GenerateForContactAsync(request);
-            if (reply is null || cancellationToken.IsCancellationRequested)
+            var result = await AiPanel.GenerateForContactDetailedAsync(request);
+            if (result is null || cancellationToken.IsCancellationRequested)
             {
                 return;
             }
 
             if (autoSend)
             {
-                await Chat.SendAsync(contactId, reply, isFromAi: true);
+                await Chat.SendAsync(contactId, result.Content, isFromAi: true);
             }
-            else if (Chat.CurrentContact?.Id == contactId)
+            else if (draftRevision is int rev)
             {
-                Chat.DraftText = reply;
+                await ApplyManualConfirmResultAsync(contactId, result.Content, rev);
+            }
+            else
+            {
+                AiPanel.LatestGeneratedReply = result.Content;
             }
         }
         catch (OperationCanceledException)
@@ -379,13 +489,6 @@ public partial class MainWindowViewModel : ViewModelBase
         catch (Exception ex)
         {
             _logger.LogError(ex, "Auto AI reply failed for {ContactId}", contactId);
-        }
-        finally
-        {
-            if (_autoDebounce.TryGetValue(contactId, out var cts) && cts.IsCancellationRequested == false)
-            {
-                // keep until superseded
-            }
         }
     }
 }

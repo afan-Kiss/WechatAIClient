@@ -126,6 +126,7 @@ public sealed class MockWechatService : IWechatService
                     SenderName = "王强",
                     SenderAvatarColor = "#0984E3",
                     SenderInitials = "王",
+                    Source = MessageSource.RemoteUser,
                     Content = "大家看下这个视觉方向，深色玻璃拟态会不会太重？",
                     Timestamp = DateTime.Today.AddHours(10).AddMinutes(5),
                     ShowTimeSeparator = true,
@@ -137,6 +138,7 @@ public sealed class MockWechatService : IWechatService
                     SenderName = "张晓彤",
                     SenderAvatarColor = "#FD79A8",
                     SenderInitials = "张",
+                    Source = MessageSource.RemoteUser,
                     Type = MessageType.Quote,
                     Content = "我觉得层次感很好，关键反馈再加强一点就行。",
                     QuoteSender = "王强",
@@ -149,6 +151,7 @@ public sealed class MockWechatService : IWechatService
                     SenderName = "王强",
                     SenderAvatarColor = "#0984E3",
                     SenderInitials = "王",
+                    Source = MessageSource.RemoteUser,
                     Type = MessageType.Image,
                     Content = "[图片]",
                     ImageUrl = "mock-image",
@@ -161,6 +164,7 @@ public sealed class MockWechatService : IWechatService
                     ContactId = "g1",
                     SenderName = "我",
                     IsSelf = true,
+                    Source = MessageSource.LocalUserManual,
                     SenderAvatarColor = "#7C5CFF",
                     SenderInitials = "我",
                     Content = "这个方向可以继续，Hover 和消息入场动画也一起加上。",
@@ -174,6 +178,7 @@ public sealed class MockWechatService : IWechatService
                     SenderName = "张晓",
                     SenderAvatarColor = "#00CEC9",
                     SenderInitials = "张",
+                    Source = MessageSource.RemoteUser,
                     Type = MessageType.File,
                     Content = "[文件]",
                     FileName = "设计参考资料合集.zip",
@@ -186,6 +191,7 @@ public sealed class MockWechatService : IWechatService
                     SenderName = "张晓",
                     SenderAvatarColor = "#00CEC9",
                     SenderInitials = "张",
+                    Source = MessageSource.RemoteUser,
                     Content = "这个方案不错",
                     Timestamp = DateTime.Today.AddHours(10).AddMinutes(24)
                 }
@@ -198,6 +204,7 @@ public sealed class MockWechatService : IWechatService
                     SenderName = "李明远",
                     SenderAvatarColor = "#00B894",
                     SenderInitials = "李",
+                    Source = MessageSource.RemoteUser,
                     Content = "Avalonia 的主题切换已经做好了吗？",
                     Timestamp = DateTime.Today.AddHours(9).AddMinutes(30),
                     ShowTimeSeparator = true,
@@ -208,6 +215,7 @@ public sealed class MockWechatService : IWechatService
                     ContactId = "f1",
                     SenderName = "我",
                     IsSelf = true,
+                    Source = MessageSource.LocalUserManual,
                     Content = "做好了，深色/浅色/跟随系统都可以实时切换。",
                     Timestamp = DateTime.Today.AddHours(9).AddMinutes(35)
                 },
@@ -217,6 +225,7 @@ public sealed class MockWechatService : IWechatService
                     SenderName = "李明远",
                     SenderAvatarColor = "#00B894",
                     SenderInitials = "李",
+                    Source = MessageSource.RemoteUser,
                     Content = "晚上一起评审一下原型？",
                     Timestamp = DateTime.Today.AddHours(9).AddMinutes(48)
                 }
@@ -288,6 +297,7 @@ public sealed class MockWechatService : IWechatService
                     SenderName = contact?.Name ?? "对方",
                     SenderAvatarColor = contact?.AvatarColor ?? "#7C5CFF",
                     SenderInitials = contact?.AvatarInitials ?? "?",
+                    Source = MessageSource.RemoteUser,
                     Content = contact?.LastMessage ?? "你好",
                     Timestamp = contact?.LastMessageTime ?? DateTime.Now,
                     ShowTimeSeparator = true,
@@ -425,6 +435,7 @@ public sealed class MockWechatService : IWechatService
                 SenderName = isFromAi ? "AI 助手" : "我",
                 IsSelf = true,
                 IsFromAi = isFromAi,
+                Source = isFromAi ? MessageSource.LocalUserAI : MessageSource.LocalUserManual,
                 SenderAvatarColor = "#7C5CFF",
                 SenderInitials = isFromAi ? "AI" : "我",
                 Type = type,
@@ -452,6 +463,14 @@ public sealed class MockWechatService : IWechatService
         string contactId,
         string content,
         CancellationToken cancellationToken = default)
+        => SimulateIncomingMessageAsync(contactId, content, mentionsMe: false, quotesMe: false, cancellationToken);
+
+    public Task SimulateIncomingMessageAsync(
+        string contactId,
+        string content,
+        bool mentionsMe,
+        bool quotesMe,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -468,7 +487,10 @@ public sealed class MockWechatService : IWechatService
                 Content = content,
                 Timestamp = DateTime.Now,
                 IsSelf = false,
-                IsFromAi = false
+                IsFromAi = false,
+                Source = MessageSource.RemoteUser,
+                MentionsMe = mentionsMe,
+                QuotesMe = quotesMe
             };
 
             if (!_messages.TryGetValue(contactId, out var list))

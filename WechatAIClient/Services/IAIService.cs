@@ -6,6 +6,6 @@ public interface IAIService
 {
     string ModelName { get; }
     bool IsConnected { get; }
-    Task<string> GenerateReplyAsync(IReadOnlyList<ChatMessage> context, CancellationToken cancellationToken = default);
+    Task<AIResponse> GenerateAsync(AIRequest request, CancellationToken cancellationToken = default);
     Task ConnectAsync(CancellationToken cancellationToken = default);
 }
