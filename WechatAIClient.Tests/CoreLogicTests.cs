@@ -192,13 +192,13 @@ public class AiModeLogicTests
         var a = contacts.First(c => c.Id == "g1");
         var b = contacts.First(c => c.Id == "f1");
         await chat.LoadContactAsync(b);
-        await chat.SendAsync(a.Id, "发给A的AI回复", isFromAi: true);
+        await chat.SendAsync(a.AccountId, a.Id, "发给A的AI回复", isFromAi: true);
 
         // Current UI still on B
         Assert.Equal("f1", chat.CurrentContact?.Id);
         Assert.DoesNotContain(chat.Messages, m => m.Content == "发给A的AI回复");
 
-        var aMessages = await wechat.GetMessagesAsync("g1");
+        var aMessages = await wechat.GetMessagesAsync(a.Key);
         Assert.Contains(aMessages, m => m.Content == "发给A的AI回复" && m.IsFromAi);
     }
 }

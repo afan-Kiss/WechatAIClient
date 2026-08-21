@@ -37,7 +37,30 @@ public sealed record BridgeMessage(
     string? ReplyToMessageId = null,
     string? LocalPath = null,
     string? FileName = null,
-    string? FileSize = null);
+    string? FileSize = null,
+    string? EmojiUrl = null,
+    string? CdnUrl = null,
+    string? ThumbUrl = null,
+    string? Md5 = null,
+    string? RawXml = null,
+    string? FromUserName = null,
+    string? ToUserName = null,
+    long? TotalLen = null,
+    int? CompressType = null,
+    string? AttachId = null,
+    string? MediaMsgId = null);
+
+public sealed record BridgeMediaDescriptor(
+    string ConversationId,
+    string MessageId,
+    string? FromUserName,
+    string? ToUserName,
+    long? TotalLen,
+    int? CompressType,
+    string? AttachId,
+    string? LocalPathHint,
+    string? CdnUrl,
+    string? RawXml);
 
 public sealed class BridgeMessageEvent
 {
@@ -92,4 +115,9 @@ public interface IWechatBridgeClient : IAsyncDisposable
         bool isFromAi = false,
         CancellationToken cancellationToken = default);
     Task<WechatVersionInfo> DetectVersionAsync(CancellationToken cancellationToken = default);
+
+    Task<string?> DownloadImageAsync(
+        BridgeMediaDescriptor descriptor,
+        string targetPath,
+        CancellationToken cancellationToken = default);
 }

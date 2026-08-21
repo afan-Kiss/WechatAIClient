@@ -46,6 +46,30 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
         return [new WechatAccountIdentity(account.UserId, account.UserId, account.DisplayName, account.AvatarPath)];
     }
 
+    public WechatConnectionState GetAccountConnectionState(string accountId)
+    {
+        if (string.IsNullOrWhiteSpace(accountId))
+        {
+            return WechatConnectionState.Disconnected;
+        }
+
+        var accounts = GetAccounts();
+        if (accounts.Count == 0)
+        {
+            return ConnectionState;
+        }
+
+        return accounts.Any(a => string.Equals(a.AccountId, accountId, StringComparison.Ordinal))
+            ? ConnectionState
+            : WechatConnectionState.Disconnected;
+    }
+
+    public bool CanSend(ConversationKey key)
+    {
+        var state = GetAccountConnectionState(key.AccountId);
+        return state == WechatConnectionState.Connected;
+    }
+
     public Task SelectAccountAsync(string? accountId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();

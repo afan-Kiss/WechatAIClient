@@ -236,6 +236,16 @@ public sealed class ProcessWechatBridgeClient : IWechatBridgeClient
         return Task.FromResult(version);
     }
 
+    public Task<string?> DownloadImageAsync(
+        BridgeMediaDescriptor descriptor,
+        string targetPath,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        _ = (descriptor, targetPath);
+        return Task.FromResult<string?>(null);
+    }
+
     /// <summary>Test/internal: raise crash and apply supervisor policy.</summary>
     public void NotifyInternalFault()
     {

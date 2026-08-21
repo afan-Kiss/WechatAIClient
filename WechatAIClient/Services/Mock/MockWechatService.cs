@@ -1,4 +1,5 @@
 using WechatAIClient.Models;
+using WechatAIClient.Services.Wechat;
 
 namespace WechatAIClient.Services.Mock;
 
@@ -71,6 +72,22 @@ public sealed class MockWechatService : IWechatService
 
     public IReadOnlyList<WechatAccountIdentity> GetAccounts() => _accounts;
 
+    public WechatConnectionState GetAccountConnectionState(string accountId)
+    {
+        lock (_gate)
+        {
+            return _accountStates.TryGetValue(accountId, out var state)
+                ? state
+                : WechatConnectionState.Disconnected;
+        }
+    }
+
+    public bool CanSend(ConversationKey key)
+    {
+        var state = GetAccountConnectionState(key.AccountId);
+        return state == WechatConnectionState.Connected;
+    }
+
     public Task SelectAccountAsync(string? accountId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -86,6 +103,21 @@ public sealed class MockWechatService : IWechatService
     {
         cancellationToken.ThrowIfCancellationRequested();
         return Task.FromResult(ConnectionState);
+    }
+
+    public void SetAccountState(string accountId, WechatConnectionState state)
+    {
+        lock (_gate)
+        {
+            _accountStates[accountId] = state;
+        }
+
+        AccountConnectionStateChanged?.Invoke(this, new AccountConnectionStateChangedEventArgs
+        {
+            AccountId = accountId,
+            State = state
+        });
+        ConnectionStateChanged?.Invoke(this, ConnectionState);
     }
 
     public Task<WechatAccountInfo?> GetCurrentAccountAsync(CancellationToken cancellationToken = default)
@@ -367,17 +399,24 @@ public sealed class MockWechatService : IWechatService
             {
                 AccountId = key.AccountId,
                 ContactId = key.ConversationId,
-                SenderName = isFromAi ? "AI 助手" : "我",
+                SenderName = "我",
                 IsSelf = true,
                 IsFromAi = isFromAi,
                 Source = isFromAi ? MessageSource.LocalUserAI : MessageSource.LocalUserManual,
                 SenderAvatarColor = "#7C5CFF",
-                SenderInitials = isFromAi ? "AI" : "我",
+                SenderInitials = "我",
                 Type = type,
-                Content = content,
+                Content = type switch
+                {
+                    MessageType.File => "【文件消息】",
+                    MessageType.Video => "【视频消息】",
+                    MessageType.Image => string.IsNullOrWhiteSpace(content) ? "[图片]" : content,
+                    _ => content
+                },
                 FileName = fileName,
                 FileSize = fileSize,
-                ImageUrl = imagePath,
+                LocalPath = imagePath,
+                ImageUrl = type == MessageType.Image ? imagePath : null,
                 Timestamp = DateTime.Now
             };
 
@@ -514,8 +553,23 @@ public sealed class MockWechatService : IWechatService
                 return _selectedAccountId;
             }
 
-            var match = _contacts.FirstOrDefault(c => c.Id == contactId);
-            return match?.AccountId ?? AccountAId;
+            var owners = _contacts
+                .Where(c => string.Equals(c.Id, contactId, StringComparison.Ordinal))
+                .Select(c => c.AccountId)
+                .Distinct(StringComparer.Ordinal)
+                .ToList();
+
+            if (owners.Count > 1)
+            {
+                throw new AmbiguousConversationException(contactId, owners);
+            }
+
+            if (owners.Count == 1)
+            {
+                return owners[0];
+            }
+
+            return AccountAId;
         }
     }
 
@@ -570,8 +624,8 @@ public sealed class MockWechatService : IWechatService
             AccountDisplayName = "Mock 账号 " + tag,
             Name = "共享联系人 (" + tag + ")",
             Type = ContactType.Friend,
-            AvatarColor = "#0984E3",
-            AvatarInitials = "共",
+            AvatarColor = tag == "A" ? "#0984E3" : "#E17055",
+            AvatarInitials = tag == "A" ? "共A" : "共B",
             LastMessage = "同一 ContactId，不同账号 " + tag,
             LastMessageTime = DateTime.Today.AddHours(10).AddMinutes(30),
             HasLastActivity = true,
@@ -678,13 +732,13 @@ public sealed class MockWechatService : IWechatService
         ]);
         SeedThread(map, AccountAId, "shared-id",
         [
-            Msg(AccountAId, "shared-id", "共享联系人", "#0984E3", "共", "来自账号 A",
-                DateTime.Today.AddHours(10).AddMinutes(30))
+            Msg(AccountAId, "shared-id", "共享联系人", "#0984E3", "共A", "来自账号 A",
+                DateTime.Today.AddHours(10).AddMinutes(30), id: "msg-1")
         ]);
         SeedThread(map, AccountBId, "shared-id",
         [
-            Msg(AccountBId, "shared-id", "共享联系人", "#0984E3", "共", "来自账号 B",
-                DateTime.Today.AddHours(10).AddMinutes(31))
+            Msg(AccountBId, "shared-id", "共享联系人", "#E17055", "共B", "来自账号 B",
+                DateTime.Today.AddHours(10).AddMinutes(31), id: "msg-1")
         ]);
         return map;
     }
@@ -706,9 +760,11 @@ public sealed class MockWechatService : IWechatService
         DateTime timestamp,
         bool isSelf = false,
         bool showSep = false,
-        string? sep = null)
+        string? sep = null,
+        string? id = null)
         => new()
         {
+            Id = id ?? Guid.NewGuid().ToString("N"),
             AccountId = accountId,
             ContactId = contactId,
             SenderName = sender,

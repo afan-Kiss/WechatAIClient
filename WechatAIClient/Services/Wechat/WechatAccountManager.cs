@@ -16,6 +16,7 @@ public interface IWechatAccountManager : IAsyncDisposable
     event EventHandler<AccountConnectionStateChangedEventArgs>? AccountConnectionStateChanged;
     event EventHandler<AccountIdentityChangedEventArgs>? AccountIdentityChanged;
     event EventHandler<WechatConnectionState>? AggregateConnectionStateChanged;
+    event EventHandler? ProfilesChanged;
 
     Task LoadProfilesAsync(CancellationToken cancellationToken = default);
     Task SaveProfilesAsync(CancellationToken cancellationToken = default);
@@ -26,13 +27,25 @@ public interface IWechatAccountManager : IAsyncDisposable
     Task ReconnectAsync(string? accountId = null, CancellationToken cancellationToken = default);
 
     WechatAccountSession? GetSession(string accountId);
+    WechatConnectionState GetAccountConnectionState(string accountId);
     IReadOnlyList<WechatAccountIdentity> GetIdentities();
     WechatConnectionState GetAggregateState();
+
+    Task<WechatAccountConnectionProfile> AddProfileAsync(
+        WechatAccountConnectionProfile profile,
+        CancellationToken cancellationToken = default);
+    Task UpdateProfileAsync(
+        WechatAccountConnectionProfile profile,
+        CancellationToken cancellationToken = default);
+    Task DeleteProfileAsync(string profileId, CancellationToken cancellationToken = default);
+    Task SetProfileEnabledAsync(string profileId, bool enabled, CancellationToken cancellationToken = default);
+    void ValidatePortsOrThrow(WechatAccountConnectionProfile candidate, string? excludeProfileId = null);
 }
 
 public sealed class WechatAccountManager : IWechatAccountManager
 {
     public const string ProfilesSettingsKey = "wechat.account.profiles";
+    public const string SelectedAccountSettingsKey = "wechat.selectedAccountId";
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -48,7 +61,8 @@ public sealed class WechatAccountManager : IWechatAccountManager
     private readonly ILogger<WechatAccountManager> _logger;
     private readonly object _gate = new();
     private readonly List<WechatAccountConnectionProfile> _profiles = [];
-    private readonly Dictionary<string, WechatAccountSession> _sessions = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, WechatAccountSession> _sessionsByProfileId = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _accountIdToProfileId = new(StringComparer.Ordinal);
     private string? _selectedAccountId;
     private bool _disposed;
 
@@ -95,7 +109,7 @@ public sealed class WechatAccountManager : IWechatAccountManager
         {
             lock (_gate)
             {
-                return _sessions.Values.ToList();
+                return _sessionsByProfileId.Values.ToList();
             }
         }
     }
@@ -104,6 +118,7 @@ public sealed class WechatAccountManager : IWechatAccountManager
     public event EventHandler<AccountConnectionStateChangedEventArgs>? AccountConnectionStateChanged;
     public event EventHandler<AccountIdentityChangedEventArgs>? AccountIdentityChanged;
     public event EventHandler<WechatConnectionState>? AggregateConnectionStateChanged;
+    public event EventHandler? ProfilesChanged;
 
     public async Task LoadProfilesAsync(CancellationToken cancellationToken = default)
     {
@@ -121,6 +136,8 @@ public sealed class WechatAccountManager : IWechatAccountManager
                 _logger.LogWarning(ex, "Failed to deserialize account profiles");
             }
         }
+
+        var selectedRaw = await _settings.GetAsync(SelectedAccountSettingsKey, cancellationToken);
 
         lock (_gate)
         {
@@ -141,6 +158,16 @@ public sealed class WechatAccountManager : IWechatAccountManager
                     null,
                     true));
             }
+
+            if (string.IsNullOrWhiteSpace(selectedRaw) ||
+                selectedRaw.Equals("__all__", StringComparison.Ordinal))
+            {
+                _selectedAccountId = null;
+            }
+            else
+            {
+                _selectedAccountId = selectedRaw;
+            }
         }
     }
 
@@ -154,17 +181,23 @@ public sealed class WechatAccountManager : IWechatAccountManager
         }
 
         await _settings.SetAsync(ProfilesSettingsKey, json, cancellationToken);
+        ProfilesChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    public Task SelectAccountAsync(string? accountId, CancellationToken cancellationToken = default)
+    public async Task SelectAccountAsync(string? accountId, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        string? normalized;
         lock (_gate)
         {
             _selectedAccountId = string.IsNullOrWhiteSpace(accountId) ? null : accountId;
+            normalized = _selectedAccountId;
         }
 
-        return Task.CompletedTask;
+        await _settings.SetAsync(
+            SelectedAccountSettingsKey,
+            normalized ?? "__all__",
+            cancellationToken);
     }
 
     public async Task StartAllAsync(CancellationToken cancellationToken = default)
@@ -180,9 +213,18 @@ public sealed class WechatAccountManager : IWechatAccountManager
 
         foreach (var profile in enabled)
         {
-            await EnsureSessionStartedAsync(profile, cancellationToken);
+            try
+            {
+                ValidatePortsOrThrow(profile, profile.ProfileId);
+                await EnsureSessionStartedAsync(profile, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to start profile {ProfileId}; continuing others", profile.ProfileId);
+            }
         }
 
+        EnsureSelectedAccountStillValid();
         AggregateConnectionStateChanged?.Invoke(this, GetAggregateState());
     }
 
@@ -191,6 +233,7 @@ public sealed class WechatAccountManager : IWechatAccountManager
         ObjectDisposedException.ThrowIf(_disposed, this);
         var profile = FindProfile(profileOrAccountId)
                       ?? throw new InvalidOperationException("Unknown profile/account: " + profileOrAccountId);
+        ValidatePortsOrThrow(profile, profile.ProfileId);
         await EnsureSessionStartedAsync(profile, cancellationToken);
     }
 
@@ -219,7 +262,14 @@ public sealed class WechatAccountManager : IWechatAccountManager
         {
             foreach (var session in Sessions)
             {
-                await session.ReconnectAsync(cancellationToken);
+                try
+                {
+                    await session.ReconnectAsync(cancellationToken);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Reconnect failed for {AccountId}", session.AccountId);
+                }
             }
         }
         else
@@ -239,12 +289,18 @@ public sealed class WechatAccountManager : IWechatAccountManager
         }
     }
 
+    public WechatConnectionState GetAccountConnectionState(string accountId)
+    {
+        var session = GetSession(accountId);
+        return session?.State ?? WechatConnectionState.Disconnected;
+    }
+
     public IReadOnlyList<WechatAccountIdentity> GetIdentities()
     {
         lock (_gate)
         {
             var list = new List<WechatAccountIdentity>();
-            foreach (var session in _sessions.Values)
+            foreach (var session in _sessionsByProfileId.Values)
             {
                 if (session.Identity is { } id)
                 {
@@ -304,6 +360,172 @@ public sealed class WechatAccountManager : IWechatAccountManager
         return sessions[0].State;
     }
 
+    public async Task<WechatAccountConnectionProfile> AddProfileAsync(
+        WechatAccountConnectionProfile profile,
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(profile);
+        ValidatePortsOrThrow(profile);
+
+        lock (_gate)
+        {
+            if (_profiles.Any(p => string.Equals(p.ProfileId, profile.ProfileId, StringComparison.Ordinal)))
+            {
+                throw new InvalidOperationException("Profile already exists: " + profile.ProfileId);
+            }
+
+            _profiles.Add(profile);
+        }
+
+        await SaveProfilesAsync(cancellationToken);
+        if (profile.Enabled)
+        {
+            try
+            {
+                await EnsureSessionStartedAsync(profile, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to start newly added profile {ProfileId}", profile.ProfileId);
+            }
+        }
+
+        return profile;
+    }
+
+    public async Task UpdateProfileAsync(
+        WechatAccountConnectionProfile profile,
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(profile);
+        ValidatePortsOrThrow(profile, profile.ProfileId);
+
+        WechatAccountSession? oldSession = null;
+        WechatAccountConnectionProfile? previous;
+        lock (_gate)
+        {
+            var idx = _profiles.FindIndex(p =>
+                string.Equals(p.ProfileId, profile.ProfileId, StringComparison.Ordinal));
+            if (idx < 0)
+            {
+                throw new InvalidOperationException("Unknown profile: " + profile.ProfileId);
+            }
+
+            previous = _profiles[idx];
+            _profiles[idx] = profile;
+            _sessionsByProfileId.TryGetValue(profile.ProfileId, out oldSession);
+        }
+
+        await SaveProfilesAsync(cancellationToken);
+
+        var needsRebuild = previous is null ||
+                           !string.Equals(previous.BaseUrl, profile.BaseUrl, StringComparison.OrdinalIgnoreCase) ||
+                           previous.HttpCallbackPort != profile.HttpCallbackPort ||
+                           previous.TcpCallbackPort != profile.TcpCallbackPort;
+
+        if (oldSession is not null && needsRebuild)
+        {
+            await DisposeSessionAsync(oldSession);
+            if (profile.Enabled)
+            {
+                await EnsureSessionStartedAsync(profile, cancellationToken);
+            }
+        }
+        else if (oldSession is not null && !profile.Enabled)
+        {
+            await oldSession.StopAsync(cancellationToken);
+        }
+        else if (oldSession is null && profile.Enabled)
+        {
+            await EnsureSessionStartedAsync(profile, cancellationToken);
+        }
+
+        AggregateConnectionStateChanged?.Invoke(this, GetAggregateState());
+    }
+
+    public async Task DeleteProfileAsync(string profileId, CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        WechatAccountSession? session;
+        lock (_gate)
+        {
+            var idx = _profiles.FindIndex(p =>
+                string.Equals(p.ProfileId, profileId, StringComparison.Ordinal));
+            if (idx < 0)
+            {
+                return;
+            }
+
+            _profiles.RemoveAt(idx);
+            _sessionsByProfileId.TryGetValue(profileId, out session);
+        }
+
+        if (session is not null)
+        {
+            await DisposeSessionAsync(session);
+        }
+
+        await SaveProfilesAsync(cancellationToken);
+        EnsureSelectedAccountStillValid();
+        AggregateConnectionStateChanged?.Invoke(this, GetAggregateState());
+    }
+
+    public async Task SetProfileEnabledAsync(
+        string profileId,
+        bool enabled,
+        CancellationToken cancellationToken = default)
+    {
+        WechatAccountConnectionProfile? profile;
+        lock (_gate)
+        {
+            profile = _profiles.FirstOrDefault(p =>
+                string.Equals(p.ProfileId, profileId, StringComparison.Ordinal));
+        }
+
+        if (profile is null)
+        {
+            throw new InvalidOperationException("Unknown profile: " + profileId);
+        }
+
+        var updated = profile with { Enabled = enabled };
+        await UpdateProfileAsync(updated, cancellationToken);
+    }
+
+    public void ValidatePortsOrThrow(WechatAccountConnectionProfile candidate, string? excludeProfileId = null)
+    {
+        ArgumentNullException.ThrowIfNull(candidate);
+        lock (_gate)
+        {
+            foreach (var other in _profiles)
+            {
+                if (!string.IsNullOrWhiteSpace(excludeProfileId) &&
+                    string.Equals(other.ProfileId, excludeProfileId, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (!other.Enabled && !candidate.Enabled)
+                {
+                    continue;
+                }
+
+                if (other.HttpCallbackPort == candidate.HttpCallbackPort)
+                {
+                    throw new InvalidOperationException(
+                        $"HTTP callback 端口冲突：{candidate.HttpCallbackPort} 已被 {other.DisplayName} 使用");
+                }
+
+                if (other.TcpCallbackPort == candidate.TcpCallbackPort)
+                {
+                    throw new InvalidOperationException(
+                        $"TCP callback 端口冲突：{candidate.TcpCallbackPort} 已被 {other.DisplayName} 使用");
+                }
+            }
+        }
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
@@ -315,11 +537,12 @@ public sealed class WechatAccountManager : IWechatAccountManager
         List<WechatAccountSession> sessions;
         lock (_gate)
         {
-            sessions = _sessions.Values.ToList();
-            _sessions.Clear();
+            sessions = _sessionsByProfileId.Values.ToList();
+            _sessionsByProfileId.Clear();
+            _accountIdToProfileId.Clear();
         }
 
-        foreach (var session in sessions)
+        foreach (var session in sessions.Distinct())
         {
             Unwire(session);
             await session.DisposeAsync();
@@ -333,7 +556,7 @@ public sealed class WechatAccountManager : IWechatAccountManager
         WechatAccountSession session;
         lock (_gate)
         {
-            if (!_sessions.TryGetValue(profile.ProfileId, out session!))
+            if (!_sessionsByProfileId.TryGetValue(profile.ProfileId, out session!))
             {
                 session = new WechatAccountSession(
                     profile,
@@ -341,12 +564,38 @@ public sealed class WechatAccountManager : IWechatAccountManager
                     _loggerFactory,
                     _parser,
                     _mediaCache);
-                _sessions[profile.ProfileId] = session;
+                _sessionsByProfileId[profile.ProfileId] = session;
+                if (!string.IsNullOrWhiteSpace(session.AccountId))
+                {
+                    _accountIdToProfileId[session.AccountId] = profile.ProfileId;
+                }
+
                 Wire(session);
             }
         }
 
         await session.StartAsync(cancellationToken);
+    }
+
+    private async Task DisposeSessionAsync(WechatAccountSession session)
+    {
+        Unwire(session);
+        try
+        {
+            await session.StopAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Stop before dispose failed for {ProfileId}", session.Profile.ProfileId);
+        }
+
+        lock (_gate)
+        {
+            _sessionsByProfileId.Remove(session.Profile.ProfileId);
+            RemoveAccountAliasesLocked(session.Profile.ProfileId);
+        }
+
+        await session.DisposeAsync();
     }
 
     private void Wire(WechatAccountSession session)
@@ -387,12 +636,82 @@ public sealed class WechatAccountManager : IWechatAccountManager
         {
             lock (_gate)
             {
-                // Keep profile-key lookup; also index by live AccountId for routing.
-                _sessions[session.AccountId] = session;
+                if (!string.IsNullOrWhiteSpace(e.OldAccountId))
+                {
+                    if (_accountIdToProfileId.TryGetValue(e.OldAccountId, out var mapped) &&
+                        string.Equals(mapped, session.Profile.ProfileId, StringComparison.Ordinal))
+                    {
+                        _accountIdToProfileId.Remove(e.OldAccountId);
+                    }
+                }
+
+                if (!string.IsNullOrWhiteSpace(e.NewAccountId))
+                {
+                    _accountIdToProfileId[e.NewAccountId] = session.Profile.ProfileId;
+                }
+
+                if (!string.IsNullOrWhiteSpace(e.OldAccountId) &&
+                    string.Equals(_selectedAccountId, e.OldAccountId, StringComparison.Ordinal))
+                {
+                    _selectedAccountId = e.NewAccountId;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(e.OldAccountId) &&
+                !string.IsNullOrWhiteSpace(e.NewAccountId) &&
+                !string.Equals(e.OldAccountId, e.NewAccountId, StringComparison.Ordinal))
+            {
+                _ = PersistSelectedAccountAsync();
             }
         }
 
         AccountIdentityChanged?.Invoke(this, e);
+    }
+
+    private async Task PersistSelectedAccountAsync()
+    {
+        try
+        {
+            string? selected;
+            lock (_gate)
+            {
+                selected = _selectedAccountId;
+            }
+
+            await _settings.SetAsync(SelectedAccountSettingsKey, selected ?? "__all__");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to persist selected account after identity change");
+        }
+    }
+
+    private void EnsureSelectedAccountStillValid()
+    {
+        lock (_gate)
+        {
+            if (_selectedAccountId is null)
+            {
+                return;
+            }
+
+            if (FindSessionLocked(_selectedAccountId) is null)
+            {
+                _selectedAccountId = null;
+            }
+        }
+    }
+
+    private void RemoveAccountAliasesLocked(string profileId)
+    {
+        var toRemove = _accountIdToProfileId
+            .Where(kv => string.Equals(kv.Value, profileId, StringComparison.Ordinal))
+            .Select(kv => kv.Key)
+            .ToList();
+        foreach (var key in toRemove)
+        {
+            _accountIdToProfileId.Remove(key);
+        }
     }
 
     private WechatAccountConnectionProfile? FindProfile(string profileOrAccountId)
@@ -407,13 +726,17 @@ public sealed class WechatAccountManager : IWechatAccountManager
 
     private WechatAccountSession? FindSessionLocked(string profileOrAccountId)
     {
-        if (_sessions.TryGetValue(profileOrAccountId, out var byKey))
+        if (_sessionsByProfileId.TryGetValue(profileOrAccountId, out var byProfile))
         {
-            return byKey;
+            return byProfile;
         }
 
-        return _sessions.Values.FirstOrDefault(s =>
-            string.Equals(s.AccountId, profileOrAccountId, StringComparison.Ordinal) ||
-            string.Equals(s.Profile.ProfileId, profileOrAccountId, StringComparison.Ordinal));
+        if (_accountIdToProfileId.TryGetValue(profileOrAccountId, out var profileId) &&
+            _sessionsByProfileId.TryGetValue(profileId, out var byAlias))
+        {
+            return byAlias;
+        }
+
+        return null;
     }
 }

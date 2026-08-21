@@ -35,6 +35,15 @@ public sealed class MultiAccountWechatService : IWechatService, IAsyncDisposable
 
     public IReadOnlyList<WechatAccountIdentity> GetAccounts() => _manager.GetIdentities();
 
+    public WechatConnectionState GetAccountConnectionState(string accountId)
+        => _manager.GetAccountConnectionState(accountId);
+
+    public bool CanSend(ConversationKey key)
+    {
+        var state = GetAccountConnectionState(key.AccountId);
+        return state == WechatConnectionState.Connected;
+    }
+
     public Task SelectAccountAsync(string? accountId, CancellationToken cancellationToken = default)
         => _manager.SelectAccountAsync(accountId, cancellationToken);
 
@@ -408,8 +417,8 @@ public sealed class MultiAccountWechatService : IWechatService, IAsyncDisposable
     }
 
     /// <summary>
-    /// Legacy contactId routing: SelectedAccountId, else first session that owns the contact,
-    /// else first session. Never "current account" for ConversationKey sends.
+    /// Legacy contactId routing: SelectedAccountId when set; otherwise unique owning session;
+    /// throws <see cref="AmbiguousConversationException"/> when multiple sessions own the contact.
     /// </summary>
     private WechatAccountSession ResolveSessionForContact(string contactId)
     {
@@ -423,15 +432,35 @@ public sealed class MultiAccountWechatService : IWechatService, IAsyncDisposable
             }
         }
 
-        foreach (var session in _manager.Sessions)
+        var owners = _manager.Sessions
+            .Where(s => s.TryGetContact(contactId, out _))
+            .ToList();
+
+        if (owners.Count == 1)
         {
-            if (session.TryGetContact(contactId, out _))
-            {
-                return session;
-            }
+            return owners[0];
         }
 
-        return _manager.Sessions.FirstOrDefault()
-               ?? throw new InvalidOperationException("No WeChat sessions available");
+        if (owners.Count > 1)
+        {
+            throw new AmbiguousConversationException(
+                contactId,
+                owners.Select(o => o.AccountId).Distinct(StringComparer.Ordinal).ToList());
+        }
+
+        var sessions = _manager.Sessions;
+        if (sessions.Count == 1)
+        {
+            return sessions[0];
+        }
+
+        if (sessions.Count == 0)
+        {
+            throw new InvalidOperationException("No WeChat sessions available");
+        }
+
+        throw new AmbiguousConversationException(
+            contactId,
+            sessions.Select(s => s.AccountId).Distinct(StringComparer.Ordinal).ToList());
     }
 }

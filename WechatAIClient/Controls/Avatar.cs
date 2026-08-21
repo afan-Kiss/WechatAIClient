@@ -23,6 +23,8 @@ public class Avatar : TemplatedControl
     public static readonly StyledProperty<IImage?> ImageSourceProperty =
         AvaloniaProperty.Register<Avatar, IImage?>(nameof(ImageSource));
 
+    private Bitmap? _ownedBitmap;
+
     public string Initials
     {
         get => GetValue(InitialsProperty);
@@ -62,8 +64,16 @@ public class Avatar : TemplatedControl
         }
     }
 
+    protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
+    {
+        DisposeOwnedBitmap();
+        base.OnDetachedFromVisualTree(e);
+    }
+
     private void TryLoadBitmap(string? path)
     {
+        DisposeOwnedBitmap();
+
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
         {
             ImageSource = null;
@@ -72,11 +82,29 @@ public class Avatar : TemplatedControl
 
         try
         {
-            ImageSource = new Bitmap(path);
+            _ownedBitmap = new Bitmap(path);
+            ImageSource = _ownedBitmap;
         }
         catch
         {
+            _ownedBitmap = null;
             ImageSource = null;
         }
+    }
+
+    private void DisposeOwnedBitmap()
+    {
+        if (_ownedBitmap is null)
+        {
+            return;
+        }
+
+        if (ReferenceEquals(ImageSource, _ownedBitmap))
+        {
+            ImageSource = null;
+        }
+
+        _ownedBitmap.Dispose();
+        _ownedBitmap = null;
     }
 }

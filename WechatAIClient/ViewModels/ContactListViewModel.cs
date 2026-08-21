@@ -17,6 +17,8 @@ public partial class ContactListViewModel : ViewModelBase
     private List<Contact> _groups = [];
     private CancellationTokenSource? _searchCts;
     private int _searchVersion;
+    private CancellationTokenSource? _initCts;
+    private int _initVersion;
     private EventHandler<MessageReceivedEventArgs>? _messageReceivedHandler;
 
     public ContactListViewModel(IWechatService wechatService, ILogger<ContactListViewModel> logger)
@@ -47,15 +49,41 @@ public partial class ContactListViewModel : ViewModelBase
 
     public event EventHandler<Contact>? ContactSelected;
 
-    public async Task InitializeAsync()
+    public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
-        _allRecent = (await _wechatService.GetRecentChatsAsync()).ToList();
-        _friends = (await _wechatService.GetContactsAsync()).ToList();
-        _groups = (await _wechatService.GetGroupsAsync()).ToList();
-        RefreshVisible();
-        if (VisibleContacts.Count > 0)
+        _initCts?.Cancel();
+        _initCts?.Dispose();
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        _initCts = cts;
+        var version = Interlocked.Increment(ref _initVersion);
+
+        try
         {
-            SelectedContact = VisibleContacts[0];
+            var recent = (await _wechatService.GetRecentChatsAsync(cts.Token)).ToList();
+            var friends = (await _wechatService.GetContactsAsync(cts.Token)).ToList();
+            var groups = (await _wechatService.GetGroupsAsync(cts.Token)).ToList();
+
+            if (version != _initVersion || cts.IsCancellationRequested)
+            {
+                return;
+            }
+
+            _allRecent = recent;
+            _friends = friends;
+            _groups = groups;
+            RefreshVisible();
+            if (VisibleContacts.Count > 0)
+            {
+                SelectedContact = VisibleContacts[0];
+            }
+            else
+            {
+                SelectedContact = null;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // superseded initialize
         }
     }
 
@@ -114,6 +142,9 @@ public partial class ContactListViewModel : ViewModelBase
         _searchCts?.Cancel();
         _searchCts?.Dispose();
         _searchCts = null;
+        _initCts?.Cancel();
+        _initCts?.Dispose();
+        _initCts = null;
     }
 
     private void OnMessageReceived(object? sender, MessageReceivedEventArgs e)

@@ -16,7 +16,8 @@ public class Round4WechatTests
     {
         var settings = new FakeSettings();
         var media = new WechatAIClient.Services.Media.MediaCacheService(
-            NullLogger<WechatAIClient.Services.Media.MediaCacheService>.Instance);
+            NullLogger<WechatAIClient.Services.Media.MediaCacheService>.Instance,
+            new StubHttpClientFactory());
         var manager = new WechatAccountManager(
             settings,
             new StubHttpClientFactory(),
@@ -176,8 +177,7 @@ public class Round4WechatTests
         chat.DraftText = "不能丢";
         await Assert.ThrowsAsync<InvalidOperationException>(async () =>
         {
-            // SendCommand uses SendTextMessageAsync which catches — call legacy path via ThrowOnSend on SendMessageAsync
-            await wechat.SendMessageAsync(chat.CurrentContact!.Id, "x");
+            await wechat.SendMessageAsync(chat.CurrentContact!.Key, "x");
         });
 
         // Prefer SendTextMessageAsync path used by UI
@@ -300,7 +300,7 @@ public class Round4WechatTests
         var contact = list.VisibleContacts.First();
         await chat.LoadContactAsync(contact);
         Assert.Equal(0, contact.UnreadCount);
-        await wechat.SimulateIncomingMessageAsync(contact.Id, "新消息");
+        await wechat.SimulateIncomingMessageAsync(contact.Key, "新消息");
         await Task.Delay(50);
         Assert.Equal(0, contact.UnreadCount);
     }
@@ -312,9 +312,9 @@ public class Round4WechatTests
         var list = TestFactory.CreateContacts(wechat);
         await list.InitializeAsync();
         var a = list.VisibleContacts[0];
-        var b = list.VisibleContacts.First(c => c.Id != a.Id);
+        var b = list.VisibleContacts.First(c => c.Key != a.Key);
         var before = b.UnreadCount;
-        await wechat.SimulateIncomingMessageAsync(b.Id, "别人会话");
+        await wechat.SimulateIncomingMessageAsync(b.Key, "别人会话");
         await Task.Delay(80);
         Assert.True(b.UnreadCount >= before + 1);
     }
@@ -326,7 +326,7 @@ public class Round4WechatTests
         var list = TestFactory.CreateContacts(wechat);
         await list.InitializeAsync();
         var target = list.VisibleContacts.Last();
-        await wechat.SimulateIncomingMessageAsync(target.Id, "置顶我");
+        await wechat.SimulateIncomingMessageAsync(target.Key, "置顶我");
         await Task.Delay(80);
         Assert.Equal(target.Id, list.VisibleContacts.First().Id);
     }

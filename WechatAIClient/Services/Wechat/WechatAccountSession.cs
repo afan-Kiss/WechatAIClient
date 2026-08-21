@@ -1,3 +1,4 @@
+using Avalonia.Threading;
 using Microsoft.Extensions.Logging;
 using WechatAIClient.Models;
 using WechatAIClient.Services.Media;
@@ -13,10 +14,14 @@ public sealed class WechatAccountSession : IAsyncDisposable
     private readonly ILogger<WechatAccountSession> _logger;
     private readonly MessageDeduplicator _deduper = new();
     private readonly PendingOutgoingTracker _pending = new();
+    private readonly GroupMemberCache _memberCache = new();
+    private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
+    private readonly SemaphoreSlim _identityRefreshGate = new(1, 1);
     private readonly object _gate = new();
     private readonly Dictionary<string, List<ChatMessage>> _messages = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Contact> _contacts = new(StringComparer.Ordinal);
     private readonly bool _ownsBridge;
+    private CancellationTokenSource? _sessionCts = new();
     private WechatAccountIdentity? _identity;
     private WechatConnectionState _state = WechatConnectionState.Disconnected;
     private bool _started;
@@ -79,6 +84,17 @@ public sealed class WechatAccountSession : IAsyncDisposable
 
     public string AccountId { get; private set; }
 
+    public bool IsStarted
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _started;
+            }
+        }
+    }
+
     public WechatConnectionState State
     {
         get
@@ -98,26 +114,88 @@ public sealed class WechatAccountSession : IAsyncDisposable
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        await _bridge.StartAsync(cancellationToken);
-        _started = true;
-        await RefreshIdentityAsync(cancellationToken);
-        await RefreshContactsCacheAsync(cancellationToken);
+        await _lifecycleGate.WaitAsync(cancellationToken);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_started)
+            {
+                return;
+            }
+
+            EnsureSessionCts();
+            await _bridge.StartAsync(cancellationToken);
+            try
+            {
+                await RefreshIdentityAsync(cancellationToken);
+                await RefreshContactsCacheAsync(cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Post-start refresh degraded for profile {ProfileId}", Profile.ProfileId);
+                lock (_gate)
+                {
+                    if (_state is WechatConnectionState.Connected)
+                    {
+                        _state = WechatConnectionState.Degraded;
+                    }
+                }
+            }
+
+            lock (_gate)
+            {
+                _started = true;
+            }
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
     }
 
     public async Task StopAsync(CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        await _bridge.StopAsync(cancellationToken);
-        _pending.Clear();
-        _started = false;
+        await _lifecycleGate.WaitAsync(cancellationToken);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            CancelSessionCts();
+            _pending.Clear();
+            await _bridge.StopAsync(cancellationToken);
+            lock (_gate)
+            {
+                _started = false;
+            }
+
+            EnsureSessionCts();
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
     }
 
     public async Task ReconnectAsync(CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        await _bridge.ReconnectAsync(cancellationToken);
-        await RefreshIdentityAsync(cancellationToken);
-        await RefreshContactsCacheAsync(cancellationToken);
+        await _lifecycleGate.WaitAsync(cancellationToken);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            EnsureSessionCts();
+            await _bridge.ReconnectAsync(cancellationToken);
+            await RefreshIdentityAsync(cancellationToken);
+            await RefreshContactsCacheAsync(cancellationToken);
+            lock (_gate)
+            {
+                _started = true;
+            }
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
     }
 
     public Task<WechatAccountInfo?> GetAccountAsync(CancellationToken cancellationToken = default)
@@ -159,6 +237,7 @@ public sealed class WechatAccountSession : IAsyncDisposable
         foreach (var m in mapped)
         {
             ScheduleMediaLoad(m);
+            ScheduleSenderAvatar(m);
         }
 
         return mapped;
@@ -187,6 +266,14 @@ public sealed class WechatAccountSession : IAsyncDisposable
             return _messages.TryGetValue(conversationId, out var list)
                 ? list.ToList()
                 : Array.Empty<ChatMessage>();
+        }
+    }
+
+    public void ClearCaches()
+    {
+        lock (_gate)
+        {
+            ClearAccountCachesLocked();
         }
     }
 
@@ -266,6 +353,7 @@ public sealed class WechatAccountSession : IAsyncDisposable
         }
 
         _disposed = true;
+        CancelSessionCts();
         _bridge.StateChanged -= OnBridgeStateChanged;
         _bridge.MessageReceived -= OnBridgeMessage;
         _bridge.OutgoingAcknowledged -= OnOutgoingAcknowledged;
@@ -274,6 +362,10 @@ public sealed class WechatAccountSession : IAsyncDisposable
         {
             await _bridge.DisposeAsync();
         }
+
+        _lifecycleGate.Dispose();
+        _identityRefreshGate.Dispose();
+        _sessionCts?.Dispose();
     }
 
     private void WireBridge()
@@ -286,48 +378,86 @@ public sealed class WechatAccountSession : IAsyncDisposable
     private async Task EnsureStartedAsync(CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        await _bridge.StartAsync(cancellationToken);
         if (_started)
         {
             return;
         }
 
-        _started = true;
-        await RefreshIdentityAsync(cancellationToken);
-        await RefreshContactsCacheAsync(cancellationToken);
+        await _lifecycleGate.WaitAsync(cancellationToken);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_started)
+            {
+                return;
+            }
+
+            EnsureSessionCts();
+            await _bridge.StartAsync(cancellationToken);
+            try
+            {
+                await RefreshIdentityAsync(cancellationToken);
+                await RefreshContactsCacheAsync(cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "EnsureStarted refresh degraded for {ProfileId}", Profile.ProfileId);
+            }
+
+            lock (_gate)
+            {
+                _started = true;
+            }
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
     }
 
     private async Task RefreshIdentityAsync(CancellationToken cancellationToken)
     {
-        var account = await _bridge.GetAccountAsync(cancellationToken);
-        if (account is null || string.IsNullOrWhiteSpace(account.UserId))
+        await _identityRefreshGate.WaitAsync(cancellationToken);
+        try
         {
-            return;
-        }
+            var account = await _bridge.GetAccountAsync(cancellationToken);
+            if (account is null || string.IsNullOrWhiteSpace(account.UserId))
+            {
+                return;
+            }
 
-        ApplyIdentity(account.UserId, account.DisplayName, account.AvatarPath);
+            ApplyIdentity(account.UserId, account.DisplayName, account.AvatarPath);
+        }
+        finally
+        {
+            _identityRefreshGate.Release();
+        }
     }
 
     private void ApplyIdentity(string wxid, string displayName, string? avatar)
     {
         string? oldId;
+        var accountChanged = false;
         lock (_gate)
         {
             oldId = _identity?.AccountId;
             if (string.Equals(oldId, wxid, StringComparison.Ordinal) &&
                 _identity is not null &&
-                string.Equals(_identity.DisplayName, displayName, StringComparison.Ordinal))
+                string.Equals(_identity.DisplayName, displayName, StringComparison.Ordinal) &&
+                string.Equals(_identity.AvatarUrl, avatar, StringComparison.Ordinal))
             {
                 return;
             }
 
+            accountChanged = !string.IsNullOrWhiteSpace(oldId) &&
+                             !string.Equals(oldId, wxid, StringComparison.Ordinal);
+            if (accountChanged)
+            {
+                ClearAccountCachesLocked();
+            }
+
             _identity = new WechatAccountIdentity(wxid, wxid, displayName, avatar);
             AccountId = wxid;
-        }
-
-        if (_bridge is LocalApiWechatBridgeClient)
-        {
-            // AccountId already mirrored from bridge login wxid.
         }
 
         IdentityChanged?.Invoke(this, new AccountIdentityChangedEventArgs
@@ -336,6 +466,17 @@ public sealed class WechatAccountSession : IAsyncDisposable
             OldAccountId = oldId,
             NewAccountId = wxid
         });
+    }
+
+    private void ClearAccountCachesLocked()
+    {
+        _contacts.Clear();
+        _messages.Clear();
+        _deduper.Clear();
+        _pending.Clear();
+        _memberCache.Clear();
+        CancelSessionCts();
+        EnsureSessionCts();
     }
 
     private async Task RefreshContactsCacheAsync(CancellationToken cancellationToken)
@@ -357,15 +498,53 @@ public sealed class WechatAccountSession : IAsyncDisposable
     {
         lock (_gate)
         {
-            foreach (var c in contacts)
+            foreach (var incoming in contacts)
             {
-                c.AccountId = AccountId;
-                c.AccountDisplayName = Identity?.DisplayName ?? Profile.DisplayName;
-                _contacts[c.Id] = c;
+                incoming.AccountId = AccountId;
+                incoming.AccountDisplayName = Identity?.DisplayName ?? Profile.DisplayName;
+                if (_contacts.TryGetValue(incoming.Id, out var existing))
+                {
+                    MergeContact(existing, incoming);
+                    ScheduleAvatarLoad(existing);
+                }
+                else
+                {
+                    _contacts[incoming.Id] = incoming;
+                    ScheduleAvatarLoad(incoming);
+                }
             }
 
             return _contacts.Values.ToList();
         }
+    }
+
+    private static void MergeContact(Contact existing, Contact incoming)
+    {
+        if (!string.IsNullOrWhiteSpace(incoming.Name))
+        {
+            existing.Name = incoming.Name;
+        }
+
+        existing.Type = incoming.Type;
+        existing.AvatarColor = incoming.AvatarColor;
+        existing.AvatarInitials = incoming.AvatarInitials;
+        if (!string.IsNullOrWhiteSpace(incoming.AvatarUrl))
+        {
+            existing.AvatarUrl = incoming.AvatarUrl;
+        }
+
+        if (incoming.HasLastActivity)
+        {
+            existing.LastMessage = incoming.LastMessage;
+            existing.LastSender = incoming.LastSender;
+            existing.LastMessageTime = incoming.LastMessageTime;
+            existing.HasLastActivity = true;
+        }
+
+        existing.MemberCount = incoming.MemberCount;
+        existing.IsOnline = incoming.IsOnline;
+        existing.AccountId = incoming.AccountId;
+        existing.AccountDisplayName = incoming.AccountDisplayName;
     }
 
     private void OnBridgeStateChanged(object? sender, WechatConnectionState state)
@@ -377,7 +556,8 @@ public sealed class WechatAccountSession : IAsyncDisposable
 
         if (state is WechatConnectionState.Connected or WechatConnectionState.Degraded)
         {
-            _ = RefreshIdentityAsync(CancellationToken.None);
+            var token = _sessionCts?.Token ?? CancellationToken.None;
+            SafeFireAndForget(ct => RefreshIdentityAsync(ct), token);
         }
 
         StateChanged?.Invoke(this, state);
@@ -388,6 +568,7 @@ public sealed class WechatAccountSession : IAsyncDisposable
         try
         {
             _pending.TryConsumeByClientRequestId(e.ClientRequestId, out _);
+            ChatMessage? pending = null;
             lock (_gate)
             {
                 if (!_messages.TryGetValue(e.ConversationId, out var list))
@@ -395,7 +576,7 @@ public sealed class WechatAccountSession : IAsyncDisposable
                     return;
                 }
 
-                var pending = list.FirstOrDefault(m =>
+                pending = list.FirstOrDefault(m =>
                     string.Equals(m.ClientRequestId, e.ClientRequestId, StringComparison.Ordinal));
                 if (pending is null)
                 {
@@ -474,6 +655,7 @@ public sealed class WechatAccountSession : IAsyncDisposable
         }
 
         ScheduleMediaLoad(message);
+        ScheduleSenderAvatar(message);
         MessageReceived?.Invoke(this, new MessageReceivedEventArgs
         {
             AccountId = AccountId,
@@ -495,18 +677,20 @@ public sealed class WechatAccountSession : IAsyncDisposable
         string? fileName = null,
         string? fileSize = null)
     {
+        var avatar = Identity?.AvatarUrl;
         var message = new ChatMessage
         {
             Id = result.MessageId ?? Guid.NewGuid().ToString("N"),
             AccountId = AccountId,
             ContactId = conversationId,
             ClientRequestId = clientRequestId,
-            SenderName = isFromAi ? "AI 助手" : "我",
+            SenderName = "我",
             IsSelf = true,
             IsFromAi = isFromAi,
             Source = isFromAi ? MessageSource.LocalUserAI : MessageSource.LocalUserManual,
             SenderAvatarColor = "#7C5CFF",
-            SenderInitials = isFromAi ? "AI" : "我",
+            SenderInitials = "我",
+            SenderAvatarUrl = avatar,
             Type = type,
             Content = content,
             LocalPath = localPath,
@@ -547,7 +731,26 @@ public sealed class WechatAccountSession : IAsyncDisposable
             BridgeMessageKind.System => MessageType.System,
             _ => MessageType.Text
         };
-        var content = PlaceholderContent(type, m.Content, m.LocalPath);
+        var content = PlaceholderContent(type, m.Content, m.LocalPath ?? m.EmojiUrl);
+
+        string? senderAvatarUrl = null;
+        if (!m.IsFromMe && m.IsGroup && !string.IsNullOrWhiteSpace(m.SenderId) &&
+            _memberCache.TryGet(AccountId, m.ConversationId, m.SenderId, out var nick, out var avatarUrl, out var avatarPath))
+        {
+            if (!string.IsNullOrWhiteSpace(nick))
+            {
+                senderName = nick;
+            }
+
+            senderAvatarUrl = avatarUrl;
+            _ = avatarPath;
+        }
+        else if (!m.IsFromMe &&
+                 _contacts.TryGetValue(m.ConversationId, out var contact) &&
+                 !string.IsNullOrWhiteSpace(contact.AvatarUrl))
+        {
+            senderAvatarUrl = contact.AvatarUrl;
+        }
 
         return new ChatMessage
         {
@@ -558,6 +761,7 @@ public sealed class WechatAccountSession : IAsyncDisposable
             SenderId = m.SenderId,
             SenderAvatarColor = m.IsFromMe ? "#7C5CFF" : "#00B894",
             SenderInitials = Initials(senderName),
+            SenderAvatarUrl = senderAvatarUrl,
             IsSelf = m.IsFromMe,
             Source = m.IsFromMe ? MessageSource.LocalUserManual : MessageSource.RemoteUser,
             Type = type,
@@ -569,8 +773,18 @@ public sealed class WechatAccountSession : IAsyncDisposable
             LocalPath = m.LocalPath,
             FileName = m.FileName,
             FileSize = m.FileSize,
-            ImageUrl = type == MessageType.Image ? m.LocalPath : null,
-            EmojiUrl = type == MessageType.Emoji ? m.LocalPath : null,
+            ImageUrl = type == MessageType.Image ? FirstNonEmpty(m.LocalPath, m.CdnUrl, m.ThumbUrl) : null,
+            EmojiUrl = type == MessageType.Emoji ? FirstNonEmpty(m.EmojiUrl, m.CdnUrl, m.ThumbUrl, m.LocalPath) : null,
+            CdnUrl = m.CdnUrl,
+            ThumbUrl = m.ThumbUrl,
+            Md5 = m.Md5,
+            RawXml = m.RawXml,
+            FromUserName = m.FromUserName,
+            ToUserName = m.ToUserName,
+            TotalLen = m.TotalLen,
+            CompressType = m.CompressType,
+            AttachId = m.AttachId,
+            MediaMsgId = m.MediaMsgId ?? m.Id,
             SendStatus = m.IsFromMe ? MessageSendStatus.Sent : MessageSendStatus.None
         };
     }
@@ -623,6 +837,82 @@ public sealed class WechatAccountSession : IAsyncDisposable
         }
     }
 
+    private void ScheduleAvatarLoad(Contact contact)
+    {
+        if (_mediaCache is null || string.IsNullOrWhiteSpace(contact.AvatarUrl))
+        {
+            return;
+        }
+
+        var accountId = AccountId;
+        var contactId = contact.Id;
+        var url = contact.AvatarUrl;
+        var token = _sessionCts?.Token ?? CancellationToken.None;
+        SafeFireAndForget(async ct =>
+        {
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, token);
+            PostUi(() => contact.AvatarLoadState = AvatarLoadState.Loading);
+            var path = await _mediaCache.GetOrFetchAvatarAsync(accountId, contactId, url, linked.Token);
+            if (!string.Equals(AccountId, accountId, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            PostUi(() =>
+            {
+                if (!string.Equals(AccountId, accountId, StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                if (!string.IsNullOrWhiteSpace(path))
+                {
+                    contact.AvatarLocalPath = path;
+                    contact.AvatarLoadState = AvatarLoadState.Loaded;
+                }
+                else
+                {
+                    contact.AvatarLoadState = AvatarLoadState.Failed;
+                }
+            });
+        }, token);
+    }
+
+    private void ScheduleSenderAvatar(ChatMessage message)
+    {
+        if (_mediaCache is null || message.IsSelf || string.IsNullOrWhiteSpace(message.SenderAvatarUrl))
+        {
+            return;
+        }
+
+        var accountId = AccountId;
+        var senderKey = message.SenderId ?? message.ContactId;
+        var url = message.SenderAvatarUrl;
+        var token = _sessionCts?.Token ?? CancellationToken.None;
+        SafeFireAndForget(async ct =>
+        {
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, token);
+            var path = await _mediaCache.GetOrFetchAvatarAsync(accountId, senderKey, url, linked.Token);
+            if (!string.Equals(AccountId, accountId, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            PostUi(() =>
+            {
+                if (!string.Equals(AccountId, accountId, StringComparison.Ordinal))
+                {
+                    return;
+                }
+
+                if (!string.IsNullOrWhiteSpace(path))
+                {
+                    message.SenderAvatarPath = path;
+                }
+            });
+        }, token);
+    }
+
     private void ScheduleMediaLoad(ChatMessage message)
     {
         if (_mediaCache is null)
@@ -635,53 +925,164 @@ public sealed class WechatAccountSession : IAsyncDisposable
             return;
         }
 
-        _ = Task.Run(async () =>
+        var accountId = AccountId;
+        var messageKey = message.Key;
+        var token = _sessionCts?.Token ?? CancellationToken.None;
+        SafeFireAndForget(async ct =>
         {
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, token);
             try
             {
-                message.MediaLoadState = MediaLoadState.Loading;
+                PostUi(() => message.MediaLoadState = MediaLoadState.Loading);
                 string? path = null;
                 if (message.Type == MessageType.Image)
                 {
+                    var descriptor = new BridgeMediaDescriptor(
+                        message.ContactId,
+                        message.MediaMsgId ?? message.Id,
+                        message.FromUserName,
+                        message.ToUserName,
+                        message.TotalLen,
+                        message.CompressType,
+                        message.AttachId,
+                        message.LocalPath,
+                        message.CdnUrl,
+                        message.RawXml);
+
                     path = await _mediaCache.GetOrFetchImageAsync(
-                        AccountId,
-                        message.Id,
-                        message.LocalPath ?? message.ImageUrl,
-                        downloadFactory: null);
-                    if (!string.IsNullOrWhiteSpace(path))
+                        messageKey,
+                        FirstNonEmpty(message.LocalPath, message.ImageUrl, message.CdnUrl),
+                        async (targetPath, downloadCt) =>
+                            await _bridge.DownloadImageAsync(descriptor, targetPath, downloadCt),
+                        linked.Token);
+
+                    if (!string.IsNullOrWhiteSpace(path) &&
+                        string.Equals(AccountId, accountId, StringComparison.Ordinal))
                     {
-                        message.LocalPath = path;
-                        message.ImageUrl = path;
+                        PostUi(() =>
+                        {
+                            message.LocalPath = path;
+                            message.ImageUrl = path;
+                        });
                     }
                 }
                 else
                 {
-                    path = await _mediaCache.GetOrFetchEmojiAsync(
-                        AccountId,
-                        message.Id,
-                        message.EmojiUrl ?? message.LocalPath);
-                    if (!string.IsNullOrWhiteSpace(path))
+                    var emojiSrc = FirstNonEmpty(message.EmojiUrl, message.CdnUrl, message.ThumbUrl, message.LocalPath);
+                    path = await _mediaCache.GetOrFetchEmojiAsync(messageKey, emojiSrc, linked.Token);
+                    if (!string.IsNullOrWhiteSpace(path) &&
+                        string.Equals(AccountId, accountId, StringComparison.Ordinal))
                     {
-                        message.EmojiUrl = path;
-                        message.LocalPath = path;
+                        PostUi(() =>
+                        {
+                            message.EmojiUrl = path;
+                            message.LocalPath = path;
+                            message.Content = "【表情消息】";
+                        });
                     }
                 }
 
-                message.MediaLoadState = string.IsNullOrWhiteSpace(path)
-                    ? MediaLoadState.Failed
-                    : MediaLoadState.Loaded;
-                if (string.IsNullOrWhiteSpace(path) && message.Type == MessageType.Emoji)
+                if (!string.Equals(AccountId, accountId, StringComparison.Ordinal))
                 {
-                    message.Content = "【表情消息】";
+                    return;
                 }
+
+                PostUi(() =>
+                {
+                    if (!string.Equals(AccountId, accountId, StringComparison.Ordinal))
+                    {
+                        return;
+                    }
+
+                    message.MediaLoadState = string.IsNullOrWhiteSpace(path)
+                        ? MediaLoadState.Failed
+                        : MediaLoadState.Loaded;
+                    if (string.IsNullOrWhiteSpace(path) && message.Type == MessageType.Emoji)
+                    {
+                        message.Content = "【表情消息】";
+                    }
+                });
+            }
+            catch (OperationCanceledException)
+            {
+                // session stopped / identity rotated
             }
             catch (Exception ex)
             {
                 _logger.LogDebug(ex, "Media load failed for {MessageId}", message.Id);
-                message.MediaLoadState = MediaLoadState.Failed;
-                message.MediaError = ex.Message;
+                PostUi(() =>
+                {
+                    message.MediaLoadState = MediaLoadState.Failed;
+                    message.MediaError = ex.Message;
+                    if (message.Type == MessageType.Emoji)
+                    {
+                        message.Content = "【表情消息】";
+                    }
+                });
             }
-        });
+        }, token);
+    }
+
+    private void EnsureSessionCts()
+    {
+        if (_sessionCts is { IsCancellationRequested: false })
+        {
+            return;
+        }
+
+        _sessionCts?.Dispose();
+        _sessionCts = new CancellationTokenSource();
+    }
+
+    private void CancelSessionCts()
+    {
+        try
+        {
+            _sessionCts?.Cancel();
+        }
+        catch
+        {
+            // ignore
+        }
+    }
+
+    private void SafeFireAndForget(Func<CancellationToken, Task> work, CancellationToken token)
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await work(token);
+            }
+            catch (OperationCanceledException)
+            {
+                // ignore
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Background session work failed for {ProfileId}", Profile.ProfileId);
+            }
+        }, CancellationToken.None);
+    }
+
+    private static void PostUi(Action action)
+    {
+        try
+        {
+            var dispatcher = Dispatcher.UIThread;
+            if (dispatcher.CheckAccess())
+            {
+                action();
+            }
+            else
+            {
+                dispatcher.Post(action);
+            }
+        }
+        catch
+        {
+            action();
+        }
     }
 
     internal static string PlaceholderContent(MessageType type, string? raw, string? localPath)
@@ -692,14 +1093,21 @@ public sealed class WechatAccountSession : IAsyncDisposable
             MessageType.Video => "【视频消息】",
             MessageType.Voice => "【语音消息】",
             MessageType.Unknown => "【暂不支持的消息】",
-            MessageType.Emoji when string.IsNullOrWhiteSpace(localPath) && string.IsNullOrWhiteSpace(raw)
-                => "【表情消息】",
-            MessageType.Emoji when string.IsNullOrWhiteSpace(localPath)
-                => string.IsNullOrWhiteSpace(raw) ? "【表情消息】" : raw,
-            MessageType.Image => string.IsNullOrWhiteSpace(raw) ? "[图片]" : raw,
-            _ => raw ?? string.Empty
+            MessageType.Emoji => "【表情消息】",
+            MessageType.Image => string.IsNullOrWhiteSpace(raw) || LooksLikeXml(raw) ? "[图片]" : raw,
+            _ => LooksLikeXml(raw) ? string.Empty : (raw ?? string.Empty)
         };
     }
+
+    private static bool LooksLikeXml(string? value)
+        => !string.IsNullOrWhiteSpace(value) &&
+           value.Contains('<', StringComparison.Ordinal) &&
+           (value.Contains("<msg", StringComparison.OrdinalIgnoreCase) ||
+            value.Contains("<emoji", StringComparison.OrdinalIgnoreCase) ||
+            value.Contains("<appmsg", StringComparison.OrdinalIgnoreCase));
+
+    private static string? FirstNonEmpty(params string?[] values)
+        => values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v));
 
     private static string Initials(string name)
     {

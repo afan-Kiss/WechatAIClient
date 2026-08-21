@@ -303,6 +303,27 @@ public sealed class DownloadImgRequest
     [JsonPropertyName("FromUserName")]
     public string? FromUserName { get; set; }
 
+    [JsonPropertyName("to_user")]
+    public string? ToUser { get; set; }
+
+    [JsonPropertyName("ToUserName")]
+    public string? ToUserName { get; set; }
+
+    [JsonPropertyName("start_pos")]
+    public long? StartPos { get; set; }
+
+    [JsonPropertyName("total_len")]
+    public long? TotalLen { get; set; }
+
+    [JsonPropertyName("data_len")]
+    public long? DataLen { get; set; }
+
+    [JsonPropertyName("compress_type")]
+    public int? CompressType { get; set; }
+
+    [JsonPropertyName("attachid")]
+    public string? AttachId { get; set; }
+
     [JsonPropertyName("path")]
     public string? Path { get; set; }
 

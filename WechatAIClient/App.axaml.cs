@@ -120,13 +120,13 @@ public partial class App : Application
         services.AddSingleton<IToastService, ToastService>();
         services.AddSingleton<IFilePickerService, AvaloniaFilePickerService>();
         services.AddHttpClient(LocalWeixinApiClient.HttpClientName);
-        services.AddSingleton<ILocalWeixinApiClient, LocalWeixinApiClient>();
+        services.AddHttpClient(MediaCacheService.HttpClientName);
         services.AddSingleton<IWechatCallbackParser, WechatCallbackParser>();
         services.AddSingleton<FakeWechatBridgeClient>();
         services.AddSingleton<BridgeSupervisor>();
-        services.AddSingleton<IWechatBridgeClient, LocalApiWechatBridgeClient>();
         services.AddSingleton<IMediaCacheService, MediaCacheService>();
         services.AddSingleton<IConversationDraftStore, ConversationDraftStore>();
+        services.AddSingleton<IConversationAiCandidateStore, ConversationAiCandidateStore>();
         services.AddSingleton<IWechatAccountManager, WechatAccountManager>();
         services.AddSingleton<MultiAccountWechatService>();
         services.AddSingleton<MockWechatService>();

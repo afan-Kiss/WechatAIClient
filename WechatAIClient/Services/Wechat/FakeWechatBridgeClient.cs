@@ -394,6 +394,34 @@ public sealed class FakeWechatBridgeClient : IWechatBridgeClient
         }
     }
 
+    public Task<string?> DownloadImageAsync(
+        BridgeMediaDescriptor descriptor,
+        string targetPath,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!string.IsNullOrWhiteSpace(descriptor.LocalPathHint) && File.Exists(descriptor.LocalPathHint))
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(targetPath);
+                if (!string.IsNullOrWhiteSpace(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+
+                File.Copy(descriptor.LocalPathHint, targetPath, overwrite: true);
+                return Task.FromResult<string?>(targetPath);
+            }
+            catch
+            {
+                return Task.FromResult<string?>(null);
+            }
+        }
+
+        return Task.FromResult<string?>(null);
+    }
+
     public ValueTask DisposeAsync()
     {
         if (_disposed)

@@ -51,6 +51,11 @@ public sealed class RoutingWechatService : IWechatService, IAsyncDisposable
 
     public IReadOnlyList<WechatAccountIdentity> GetAccounts() => _active.GetAccounts();
 
+    public WechatConnectionState GetAccountConnectionState(string accountId)
+        => _active.GetAccountConnectionState(accountId);
+
+    public bool CanSend(ConversationKey key) => _active.CanSend(key);
+
     public async Task SelectAccountAsync(string? accountId, CancellationToken cancellationToken = default)
     {
         await ResolveAsync(force: false, cancellationToken);

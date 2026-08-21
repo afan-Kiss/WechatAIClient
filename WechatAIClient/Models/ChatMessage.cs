@@ -2,6 +2,7 @@ namespace WechatAIClient.Models;
 
 public sealed class ChatMessage : System.ComponentModel.INotifyPropertyChanged
 {
+    private string _id = Guid.NewGuid().ToString("N");
     private bool _isPinned;
     private MessageSendStatus _sendStatus = MessageSendStatus.None;
     private string? _imageUrl;
@@ -12,7 +13,22 @@ public sealed class ChatMessage : System.ComponentModel.INotifyPropertyChanged
     private MediaLoadState _mediaLoadState;
     private string? _mediaError;
 
-    public string Id { get; set; } = Guid.NewGuid().ToString("N");
+    public string Id
+    {
+        get => _id;
+        set
+        {
+            if (string.Equals(_id, value, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            _id = value ?? string.Empty;
+            PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(Id)));
+            PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(Key)));
+        }
+    }
+
     public string AccountId { get; set; } = string.Empty;
     public string ContactId { get; set; } = string.Empty;
     public ConversationKey Conversation => new(AccountId, ContactId);
@@ -40,22 +56,75 @@ public sealed class ChatMessage : System.ComponentModel.INotifyPropertyChanged
     public string? ReplyToMessageId { get; set; }
     public string? RawMessageType { get; set; }
 
+    public string? CdnUrl { get; set; }
+    public string? ThumbUrl { get; set; }
+    public string? Md5 { get; set; }
+    public string? RawXml { get; set; }
+    public string? FromUserName { get; set; }
+    public string? ToUserName { get; set; }
+    public long? TotalLen { get; set; }
+    public int? CompressType { get; set; }
+    public string? AttachId { get; set; }
+    public string? MediaMsgId { get; set; }
+
     public string? ImageUrl
     {
         get => _imageUrl;
-        set => SetField(ref _imageUrl, value, nameof(ImageUrl));
+        set
+        {
+            if (SetField(ref _imageUrl, value, nameof(ImageUrl)))
+            {
+                PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(ResolvedMediaPath)));
+            }
+        }
     }
 
     public string? LocalPath
     {
         get => _localPath;
-        set => SetField(ref _localPath, value, nameof(LocalPath));
+        set
+        {
+            if (SetField(ref _localPath, value, nameof(LocalPath)))
+            {
+                PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(ResolvedMediaPath)));
+            }
+        }
     }
 
     public string? EmojiUrl
     {
         get => _emojiUrl;
-        set => SetField(ref _emojiUrl, value, nameof(EmojiUrl));
+        set
+        {
+            if (SetField(ref _emojiUrl, value, nameof(EmojiUrl)))
+            {
+                PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(ResolvedMediaPath)));
+            }
+        }
+    }
+
+    /// <summary>Preferred local path for UI image binding (LocalPath, then local ImageUrl/EmojiUrl).</summary>
+    public string? ResolvedMediaPath
+    {
+        get
+        {
+            if (!string.IsNullOrWhiteSpace(_localPath))
+            {
+                return _localPath;
+            }
+
+            if (IsUsableLocalPath(_imageUrl))
+            {
+                return _imageUrl;
+            }
+
+            if (IsUsableLocalPath(_emojiUrl))
+            {
+                return _emojiUrl;
+            }
+
+            return _localPath ?? _imageUrl ?? _emojiUrl;
+        }
     }
 
     public string? SenderAvatarUrl
@@ -135,14 +204,38 @@ public sealed class ChatMessage : System.ComponentModel.INotifyPropertyChanged
 
     public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
 
-    private void SetField<T>(ref T field, T value, string name)
+    private bool SetField<T>(ref T field, T value, string name)
     {
         if (Equals(field, value))
         {
-            return;
+            return false;
         }
 
         field = value;
         PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(name));
+        return true;
+    }
+
+    private static bool IsUsableLocalPath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        if (path.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+            path.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        try
+        {
+            return File.Exists(path);
+        }
+        catch
+        {
+            return false;
+        }
     }
 }

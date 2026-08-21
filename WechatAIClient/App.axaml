@@ -15,6 +15,7 @@
       <conv:MessageTypeEqualsConverter x:Key="MessageTypeEqualsConverter" />
       <conv:TimeDisplayConverter x:Key="TimeDisplayConverter" />
       <conv:BoolToHorizontalAlignmentConverter x:Key="BoolToHorizontalAlignmentConverter" />
+      <conv:PathToBitmapConverter x:Key="PathToBitmapConverter" />
     </ResourceDictionary>
   </Application.Resources>
 

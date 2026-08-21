@@ -17,11 +17,12 @@ public partial class ChatViewModel : ViewModelBase
     private readonly IAISettingsService _aiSettings;
     private readonly IConversationDraftStore _drafts;
     private readonly ILogger<ChatViewModel> _logger;
+    private readonly Dictionary<string, int> _draftRevisions = new(StringComparer.Ordinal);
     private CancellationTokenSource? _loadCts;
     private int _loadVersion;
-    private int _draftRevision;
     private bool _suppressDraftRevision;
     private EventHandler<MessageReceivedEventArgs>? _messageReceivedHandler;
+    private EventHandler<AccountConnectionStateChangedEventArgs>? _accountStateHandler;
     private HashSet<string> _pinnedIds = new(StringComparer.Ordinal);
 
     public ChatViewModel(
@@ -41,11 +42,25 @@ public partial class ChatViewModel : ViewModelBase
 
         _messageReceivedHandler = OnMessageReceived;
         _wechatService.MessageReceived += _messageReceivedHandler;
+        _accountStateHandler = (_, _) =>
+            Dispatcher.UIThread.Post(NotifyCanSendChanged);
+        _wechatService.AccountConnectionStateChanged += _accountStateHandler;
     }
 
     public ObservableCollection<ChatMessage> Messages { get; } = [];
 
-    public int DraftRevision => _draftRevision;
+    public int DraftRevision
+    {
+        get
+        {
+            if (CurrentContact is null)
+            {
+                return 0;
+            }
+
+            return _draftRevisions.TryGetValue(CurrentContact.Key.StableKey, out var rev) ? rev : 0;
+        }
+    }
 
     [ObservableProperty]
     private Contact? _currentContact;
@@ -77,21 +92,44 @@ public partial class ChatViewModel : ViewModelBase
         !IsSending &&
         CurrentContact is not null &&
         !string.IsNullOrWhiteSpace(DraftText) &&
-        _wechatService.ConnectionState == WechatConnectionState.Connected;
+        _wechatService.CanSend(CurrentContact.Key);
 
     public void NotifyConnectionStateChanged() => NotifyCanSendChanged();
 
     public event EventHandler<ChatMessagesChangedEventArgs>? MessagesChanged;
     public event EventHandler? MessagesUpdated;
     public event EventHandler? RequestAiAssist;
-    public event EventHandler<string>? MessageSent;
+    public event EventHandler<ConversationKey>? MessageSent;
     public event EventHandler<Contact>? ContactPreviewUpdated;
+
+    public void ClearConversation()
+    {
+        _loadCts?.Cancel();
+        _loadCts?.Dispose();
+        _loadCts = null;
+        Interlocked.Increment(ref _loadVersion);
+
+        if (CurrentContact is { } previous)
+        {
+            _drafts.SetDraft(previous.Key, DraftText);
+        }
+
+        CurrentContact = null;
+        Messages.Clear();
+        IsEmojiPickerOpen = false;
+        _pinnedIds = new HashSet<string>(StringComparer.Ordinal);
+        _suppressDraftRevision = true;
+        DraftText = string.Empty;
+        _suppressDraftRevision = false;
+        NotifyCanSendChanged();
+        OnPropertyChanged(nameof(DraftRevision));
+        RaiseMessagesChanged(string.Empty, string.Empty, forceScroll: false);
+    }
 
     public async Task LoadContactAsync(Contact contact)
     {
         ArgumentNullException.ThrowIfNull(contact);
 
-        // Persist previous draft before switching.
         if (CurrentContact is { } previous)
         {
             _drafts.SetDraft(previous.Key, DraftText);
@@ -102,8 +140,6 @@ public partial class ChatViewModel : ViewModelBase
         var cts = new CancellationTokenSource();
         _loadCts = cts;
         var version = Interlocked.Increment(ref _loadVersion);
-        var contactId = contact.Id;
-        var accountId = contact.AccountId;
         var key = contact.Key;
 
         CurrentContact = contact;
@@ -113,15 +149,15 @@ public partial class ChatViewModel : ViewModelBase
         _suppressDraftRevision = true;
         DraftText = _drafts.GetDraft(key) ?? string.Empty;
         _suppressDraftRevision = false;
+        OnPropertyChanged(nameof(DraftRevision));
         NotifyCanSendChanged();
-        await RefreshPinsAsync(accountId, contactId);
+        await RefreshPinsAsync(key, version);
 
         try
         {
             var messages = await _wechatService.GetMessagesAsync(key, cts.Token);
             if (version != _loadVersion ||
-                CurrentContact?.Id != contactId ||
-                !string.Equals(CurrentContact?.AccountId, accountId, StringComparison.Ordinal) ||
+                CurrentContact?.Key != key ||
                 cts.IsCancellationRequested)
             {
                 return;
@@ -134,7 +170,7 @@ public partial class ChatViewModel : ViewModelBase
                 Messages.Add(message);
             }
 
-            RaiseMessagesChanged(contactId, forceScroll: true);
+            RaiseMessagesChanged(key.AccountId, key.ConversationId, forceScroll: true);
         }
         catch (OperationCanceledException)
         {
@@ -142,7 +178,7 @@ public partial class ChatViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to load messages for {ContactId}", contactId);
+            _logger.LogError(ex, "Failed to load messages for {Key}", key);
         }
     }
 
@@ -159,15 +195,32 @@ public partial class ChatViewModel : ViewModelBase
         }
     }
 
-    public bool TryApplyAiDraft(string text, int expectedRevision)
+    public bool TryApplyAiDraft(ConversationKey target, string text, int expectedRevision)
     {
-        if (_draftRevision != expectedRevision)
+        if (CurrentContact?.Key != target)
+        {
+            return false;
+        }
+
+        var key = target.StableKey;
+        var current = _draftRevisions.TryGetValue(key, out var rev) ? rev : 0;
+        if (current != expectedRevision)
         {
             return false;
         }
 
         SetDraftFromAi(text);
         return true;
+    }
+
+    public bool TryApplyAiDraft(string text, int expectedRevision)
+    {
+        if (CurrentContact is null)
+        {
+            return false;
+        }
+
+        return TryApplyAiDraft(CurrentContact.Key, text, expectedRevision);
     }
 
     public bool IsPinned(string? messageId)
@@ -188,12 +241,11 @@ public partial class ChatViewModel : ViewModelBase
             return;
         }
 
+        var key = CurrentContact.Key;
+        var version = _loadVersion;
         var wasPinned = IsPinned(message.Id);
-        var pinned = await _aiSettings.TogglePinAsync(
-            CurrentContact.AccountId,
-            CurrentContact.Id,
-            message.Id);
-        await RefreshPinsAsync(CurrentContact.AccountId, CurrentContact.Id);
+        var pinned = await _aiSettings.TogglePinAsync(key.AccountId, key.ConversationId, message.Id);
+        await RefreshPinsAsync(key, version);
         if (!wasPinned && !pinned)
         {
             await _toast.ShowAsync("最多置顶 20 条");
@@ -219,8 +271,10 @@ public partial class ChatViewModel : ViewModelBase
             return;
         }
 
-        await _aiSettings.TogglePinAsync(CurrentContact.AccountId, CurrentContact.Id, message.Id);
-        await RefreshPinsAsync(CurrentContact.AccountId, CurrentContact.Id);
+        var key = CurrentContact.Key;
+        var version = _loadVersion;
+        await _aiSettings.TogglePinAsync(key.AccountId, key.ConversationId, message.Id);
+        await RefreshPinsAsync(key, version);
         await _toast.ShowAsync("已取消置顶");
     }
 
@@ -232,26 +286,25 @@ public partial class ChatViewModel : ViewModelBase
             return;
         }
 
-        var targetContactId = CurrentContact.Id;
+        var target = CurrentContact.Key;
         var pending = DraftText.Trim();
         DraftText = string.Empty;
         IsSending = true;
 
         try
         {
-            if (_wechatService.ConnectionState != WechatConnectionState.Connected)
+            if (!_wechatService.CanSend(target))
             {
                 DraftText = pending;
                 await _toast.ShowAsync("微信未连接，无法发送");
                 return;
             }
 
-            var key = CurrentContact!.Key;
-            var result = await _wechatService.SendTextMessageAsync(key, pending);
-            _drafts.Clear(key);
+            var result = await _wechatService.SendTextMessageAsync(target, pending);
+            _drafts.Clear(target);
             if (!result.Success)
             {
-                if (CurrentContact?.Id == targetContactId && string.IsNullOrEmpty(DraftText))
+                if (CurrentContact?.Key == target && string.IsNullOrEmpty(DraftText))
                 {
                     DraftText = pending;
                 }
@@ -260,11 +313,11 @@ public partial class ChatViewModel : ViewModelBase
                 return;
             }
 
-            // Prefer message from service cache via GetMessages or build from result
             var message = new ChatMessage
             {
                 Id = result.MessageId ?? Guid.NewGuid().ToString("N"),
-                ContactId = targetContactId,
+                AccountId = target.AccountId,
+                ContactId = target.ConversationId,
                 ClientRequestId = result.ClientRequestId,
                 SenderName = "我",
                 IsSelf = true,
@@ -276,22 +329,21 @@ public partial class ChatViewModel : ViewModelBase
                 SendStatus = MessageSendStatus.Sent
             };
 
-            // RealWechatService already stores; avoid duplicate if event/path added it
-            if (CurrentContact?.Id == targetContactId &&
+            if (CurrentContact?.Key == target &&
                 Messages.All(m => m.Id != message.Id &&
                                   !string.Equals(m.ClientRequestId, message.ClientRequestId, StringComparison.Ordinal)))
             {
                 Messages.Add(message);
-                RaiseMessagesChanged(targetContactId, forceScroll: true);
+                RaiseMessagesChanged(target.AccountId, target.ConversationId, forceScroll: true);
             }
 
-            UpdateContactPreview(targetContactId, pending, "我", message.Timestamp);
-            MessageSent?.Invoke(this, targetContactId);
+            UpdateContactPreview(target, pending, "我", message.Timestamp);
+            MessageSent?.Invoke(this, target);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to send message");
-            if (CurrentContact?.Id == targetContactId && string.IsNullOrEmpty(DraftText))
+            if (CurrentContact?.Key == target && string.IsNullOrEmpty(DraftText))
             {
                 DraftText = pending;
             }
@@ -337,17 +389,18 @@ public partial class ChatViewModel : ViewModelBase
             return;
         }
 
+        var key = new ConversationKey(
+            SqliteStore.NormalizeAccountId(accountId),
+            contactId);
+
         try
         {
-            if (_wechatService.ConnectionState != WechatConnectionState.Connected)
+            if (!_wechatService.CanSend(key))
             {
                 await _toast.ShowAsync("微信未连接，无法发送");
                 return;
             }
 
-            var key = new ConversationKey(
-                SqliteStore.NormalizeAccountId(accountId),
-                contactId);
             var message = await _wechatService.SendMessageAsync(
                 key,
                 content.Trim(),
@@ -360,20 +413,20 @@ public partial class ChatViewModel : ViewModelBase
                 return;
             }
 
-            if (CurrentContact?.Id == contactId &&
+            if (CurrentContact?.Key == key &&
                 Messages.All(m => m.Id != message.Id &&
                                   !string.Equals(m.ClientRequestId, message.ClientRequestId, StringComparison.Ordinal)))
             {
                 Messages.Add(message);
-                RaiseMessagesChanged(contactId, forceScroll: IsNearBottom || KeepAtBottom);
+                RaiseMessagesChanged(key.AccountId, key.ConversationId, forceScroll: IsNearBottom || KeepAtBottom);
             }
 
-            UpdateContactPreview(contactId, content.Trim(), message.SenderName, message.Timestamp);
-            MessageSent?.Invoke(this, contactId);
+            UpdateContactPreview(key, content.Trim(), message.SenderName, message.Timestamp);
+            MessageSent?.Invoke(this, key);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to send message to {ContactId}", contactId);
+            _logger.LogError(ex, "Failed to send message to {Key}", key);
             throw;
         }
     }
@@ -392,23 +445,23 @@ public partial class ChatViewModel : ViewModelBase
             return;
         }
 
-        var targetContactId = CurrentContact.Id;
+        var target = CurrentContact.Key;
         var fileName = Path.GetFileName(path);
         var message = await _wechatService.SendMessageAsync(
-            targetContactId,
+            target,
             "[图片]",
             MessageType.Image,
             fileName: fileName,
             imagePath: path);
 
-        if (CurrentContact?.Id == targetContactId)
+        if (CurrentContact?.Key == target)
         {
             Messages.Add(message);
-            RaiseMessagesChanged(targetContactId, forceScroll: true);
+            RaiseMessagesChanged(target.AccountId, target.ConversationId, forceScroll: true);
         }
 
-        UpdateContactPreview(targetContactId, "[图片]", "我", message.Timestamp);
-        MessageSent?.Invoke(this, targetContactId);
+        UpdateContactPreview(target, "[图片]", "我", message.Timestamp);
+        MessageSent?.Invoke(this, target);
     }
 
     [RelayCommand]
@@ -425,25 +478,25 @@ public partial class ChatViewModel : ViewModelBase
             return;
         }
 
-        var targetContactId = CurrentContact.Id;
+        var target = CurrentContact.Key;
         var fileName = Path.GetFileName(path);
         var fileInfo = new FileInfo(path);
         var sizeText = FormatSize(fileInfo.Exists ? fileInfo.Length : 0);
         var message = await _wechatService.SendMessageAsync(
-            targetContactId,
+            target,
             "[文件]",
             MessageType.File,
             fileName: fileName,
             fileSize: sizeText);
 
-        if (CurrentContact?.Id == targetContactId)
+        if (CurrentContact?.Key == target)
         {
             Messages.Add(message);
-            RaiseMessagesChanged(targetContactId, forceScroll: true);
+            RaiseMessagesChanged(target.AccountId, target.ConversationId, forceScroll: true);
         }
 
-        UpdateContactPreview(targetContactId, $"文件已发送：{fileName}", "我", message.Timestamp);
-        MessageSent?.Invoke(this, targetContactId);
+        UpdateContactPreview(target, $"文件已发送：{fileName}", "我", message.Timestamp);
+        MessageSent?.Invoke(this, target);
     }
 
     [RelayCommand]
@@ -482,6 +535,12 @@ public partial class ChatViewModel : ViewModelBase
             _messageReceivedHandler = null;
         }
 
+        if (_accountStateHandler is not null)
+        {
+            _wechatService.AccountConnectionStateChanged -= _accountStateHandler;
+            _accountStateHandler = null;
+        }
+
         _loadCts?.Cancel();
         _loadCts?.Dispose();
         _loadCts = null;
@@ -489,14 +548,17 @@ public partial class ChatViewModel : ViewModelBase
 
     partial void OnDraftTextChanged(string value)
     {
-        if (!_suppressDraftRevision)
+        if (!_suppressDraftRevision && CurrentContact is { } contact)
         {
-            Interlocked.Increment(ref _draftRevision);
+            var key = contact.Key.StableKey;
+            _draftRevisions.TryGetValue(key, out var rev);
+            _draftRevisions[key] = rev + 1;
+            OnPropertyChanged(nameof(DraftRevision));
         }
 
-        if (CurrentContact is { } contact)
+        if (CurrentContact is { } c)
         {
-            _drafts.SetDraft(contact.Key, value);
+            _drafts.SetDraft(c.Key, value);
         }
 
         NotifyCanSendChanged();
@@ -504,24 +566,31 @@ public partial class ChatViewModel : ViewModelBase
 
     partial void OnCurrentContactChanged(Contact? value) => NotifyCanSendChanged();
 
-    private async Task RefreshPinsAsync(string accountId, string contactId)
+    private async Task RefreshPinsAsync(ConversationKey key, int loadVersion)
     {
         try
         {
-            var pins = await _aiSettings.GetPinnedIdsAsync(accountId, contactId);
+            var pins = await _aiSettings.GetPinnedIdsAsync(key.AccountId, key.ConversationId);
+            if (loadVersion != _loadVersion || CurrentContact?.Key != key)
+            {
+                return;
+            }
+
             _pinnedIds = new HashSet<string>(pins, StringComparer.Ordinal);
             foreach (var message in Messages)
             {
                 message.IsPinned = _pinnedIds.Contains(message.Id);
             }
 
-            // Force item rebind for IsPinned visibility
             OnPropertyChanged(nameof(Messages));
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to refresh pins for {AccountId}/{ContactId}", accountId, contactId);
-            _pinnedIds = new HashSet<string>(StringComparer.Ordinal);
+            _logger.LogWarning(ex, "Failed to refresh pins for {Key}", key);
+            if (loadVersion == _loadVersion && CurrentContact?.Key == key)
+            {
+                _pinnedIds = new HashSet<string>(StringComparer.Ordinal);
+            }
         }
     }
 
@@ -535,7 +604,7 @@ public partial class ChatViewModel : ViewModelBase
     {
         Dispatcher.UIThread.Post(() =>
         {
-            if (CurrentContact?.Id != e.ContactId)
+            if (CurrentContact is null || CurrentContact.Key != e.Conversation)
             {
                 return;
             }
@@ -549,14 +618,14 @@ public partial class ChatViewModel : ViewModelBase
             if (Messages.All(m => m.Id != e.Message.Id))
             {
                 Messages.Add(e.Message);
-                RaiseMessagesChanged(e.ContactId, forceScroll: IsNearBottom || KeepAtBottom);
+                RaiseMessagesChanged(e.AccountId, e.ContactId, forceScroll: IsNearBottom || KeepAtBottom);
             }
         });
     }
 
-    private void UpdateContactPreview(string contactId, string content, string sender, DateTime timestamp)
+    private void UpdateContactPreview(ConversationKey key, string content, string sender, DateTime timestamp)
     {
-        if (CurrentContact?.Id == contactId)
+        if (CurrentContact?.Key == key)
         {
             CurrentContact.LastMessage = content;
             CurrentContact.LastSender = sender;
@@ -565,9 +634,9 @@ public partial class ChatViewModel : ViewModelBase
         }
     }
 
-    private void RaiseMessagesChanged(string contactId, bool forceScroll)
+    private void RaiseMessagesChanged(string accountId, string contactId, bool forceScroll)
     {
-        MessagesChanged?.Invoke(this, new ChatMessagesChangedEventArgs(contactId, forceScroll));
+        MessagesChanged?.Invoke(this, new ChatMessagesChangedEventArgs(accountId, contactId, forceScroll));
         MessagesUpdated?.Invoke(this, EventArgs.Empty);
     }
 

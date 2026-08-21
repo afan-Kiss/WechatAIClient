@@ -336,10 +336,14 @@ public class AiFromAiLoopTests
     public async Task LocalUserAI_DoesNotAppearAsRemoteTriggerCandidate()
     {
         var wechat = new MockWechatService();
-        await wechat.SendMessageAsync("g1", "AI话", isFromAi: true);
-        var messages = await wechat.GetMessagesAsync("g1");
+        await wechat.SendMessageAsync(
+            new ConversationKey(MockWechatService.AccountAId, "g1"),
+            "AI话",
+            isFromAi: true);
+        var messages = await wechat.GetMessagesAsync(new ConversationKey(MockWechatService.AccountAId, "g1"));
         var last = messages.Last(m => m.IsFromAi);
         Assert.Equal(MessageSource.LocalUserAI, last.Source);
         Assert.True(last.IsSelf);
+        Assert.Equal("我", last.SenderName);
     }
 }

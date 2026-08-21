@@ -16,9 +16,16 @@ public interface IWechatService
 
     IReadOnlyList<WechatAccountIdentity> GetAccounts();
 
+    /// <summary>Per-account connection state (not the aggregate).</summary>
+    WechatConnectionState GetAccountConnectionState(string accountId);
+
+    /// <summary>Whether the target conversation's owning account can send.</summary>
+    bool CanSend(ConversationKey key);
+
     Task SelectAccountAsync(string? accountId, CancellationToken cancellationToken = default);
 
     Task<WechatConnectionState> GetConnectionStateAsync(CancellationToken cancellationToken = default);
+
     Task<WechatAccountInfo?> GetCurrentAccountAsync(CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<Contact>> GetContactsAsync(CancellationToken cancellationToken = default);

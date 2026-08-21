@@ -55,6 +55,13 @@ public sealed class WechatIncomingMessage
     public string? ImagePath { get; set; }
     public string? FilePath { get; set; }
     public string? RawType { get; set; }
+    public long? TotalLen { get; set; }
+    public int? CompressType { get; set; }
+    public string? AttachId { get; set; }
+    public string? CdnUrl { get; set; }
+    public string? ThumbUrl { get; set; }
+    public string? Md5 { get; set; }
+    public string? RawXml { get; set; }
 }
 
 public sealed class WechatBridgeEvent
@@ -277,6 +284,32 @@ public sealed class WechatCallbackParser : IWechatCallbackParser
         var mappedType = WechatMessageTypeMapper.Map(rawType, content);
         var kind = ResolveKind(isSelf, isGroup, mappedType);
 
+        var totalLenRaw = GetString(item, "total_len", "TotalLen", "datalen", "data_len");
+        long? totalLen = null;
+        if (long.TryParse(totalLenRaw, out var parsedLen))
+        {
+            totalLen = parsedLen;
+        }
+
+        var compressRaw = GetString(item, "compress_type", "CompressType", "compressType");
+        int? compressType = null;
+        if (int.TryParse(compressRaw, out var parsedCompress))
+        {
+            compressType = parsedCompress;
+        }
+
+        var cdnUrl = GetString(item, "cdnurl", "cdn_url", "CdnUrl", "cdnUrl");
+        var thumbUrl = GetString(item, "thumburl", "thumb_url", "ThumbUrl", "thumbUrl");
+        var md5 = GetString(item, "md5", "MD5", "Md5");
+        var attachId = GetString(item, "attachid", "attach_id", "AttachId", "attachId");
+        var looksLikeXml = content.Contains('<', StringComparison.Ordinal) &&
+                           (content.Contains("<msg", StringComparison.OrdinalIgnoreCase) ||
+                            content.Contains("<emoji", StringComparison.OrdinalIgnoreCase) ||
+                            content.Contains("<appmsg", StringComparison.OrdinalIgnoreCase));
+        var rawXml = mappedType is "Emotion" or "Emoji" or "Image" or "File"
+            ? (looksLikeXml ? content : GetString(item, "raw_xml", "RawXml", "xml"))
+            : GetString(item, "raw_xml", "RawXml", "xml");
+
         var message = new WechatIncomingMessage
         {
             MessageId = msgId,
@@ -299,7 +332,14 @@ public sealed class WechatCallbackParser : IWechatCallbackParser
             FileName = GetString(item, "file_name", "filename", "title"),
             FilePath = GetString(item, "file_path", "filepath", "path"),
             ImagePath = GetString(item, "image_path", "img_path", "path"),
-            RawType = rawType
+            RawType = rawType,
+            TotalLen = totalLen,
+            CompressType = compressType,
+            AttachId = attachId,
+            CdnUrl = cdnUrl,
+            ThumbUrl = thumbUrl,
+            Md5 = md5,
+            RawXml = rawXml
         };
 
         return new WechatBridgeEvent

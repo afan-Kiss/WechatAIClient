@@ -643,7 +643,16 @@ public partial class AIPanelViewModel : ViewModelBase
         request.IncludeOwnMessages = IncludeOwnMessages;
         request.ReplyStyle = ReplyStyle;
         request.ReplyLength = ReplyLength;
-        if (request.TemporaryInstruction is null && !string.IsNullOrWhiteSpace(TemporaryInstruction))
+        var requestMatchesBound =
+            !string.IsNullOrWhiteSpace(_boundContactId) &&
+            string.Equals(request.ContactId, _boundContactId, StringComparison.Ordinal) &&
+            string.Equals(
+                SqliteStore.NormalizeAccountId(request.AccountId),
+                _boundAccountId,
+                StringComparison.Ordinal);
+        if (request.TemporaryInstruction is null &&
+            requestMatchesBound &&
+            !string.IsNullOrWhiteSpace(TemporaryInstruction))
         {
             request.TemporaryInstruction = TemporaryInstruction;
         }
@@ -750,9 +759,12 @@ public partial class AIPanelViewModel : ViewModelBase
             }
 
             await _sqlite.InsertHistoryAsync(history);
-            LatestGeneratedReply = result.Content;
+            if (requestMatchesBound)
+            {
+                LatestGeneratedReply = result.Content;
+            }
 
-            if (hadTempInstruction)
+            if (hadTempInstruction && requestMatchesBound)
             {
                 TemporaryInstruction = string.Empty;
             }

@@ -902,7 +902,23 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
     }
 
     private static BridgeMessage ToBridgeMessage(WechatIncomingMessage msg, bool isFromMe)
-        => new(
+    {
+        var kind = msg.MessageType switch
+        {
+            "Image" => BridgeMessageKind.Image,
+            "File" => BridgeMessageKind.File,
+            "Emoji" or "Emotion" => BridgeMessageKind.Emoji,
+            "Video" => BridgeMessageKind.Video,
+            "Voice" => BridgeMessageKind.Voice,
+            "System" => BridgeMessageKind.System,
+            _ => BridgeMessageKind.Text
+        };
+
+        var emojiUrl = kind == BridgeMessageKind.Emoji
+            ? FirstNonEmpty(msg.CdnUrl, msg.ThumbUrl, msg.ImagePath)
+            : null;
+
+        return new BridgeMessage(
             msg.MessageId,
             msg.ConversationId,
             msg.Content,
@@ -911,22 +927,93 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
             msg.SenderId ?? msg.FromWxid,
             msg.SenderDisplayName,
             msg.Timestamp,
-            msg.MessageType switch
-            {
-                "Image" => BridgeMessageKind.Image,
-                "File" => BridgeMessageKind.File,
-                "Emoji" => BridgeMessageKind.Emoji,
-                "Video" => BridgeMessageKind.Video,
-                "Voice" => BridgeMessageKind.Voice,
-                "System" => BridgeMessageKind.System,
-                _ => BridgeMessageKind.Text
-            },
+            kind,
             msg.MentionsMe,
             msg.IsReplyToMe,
             msg.QuoteMessageId,
             msg.ImagePath ?? msg.FilePath,
             msg.FileName,
-            msg.FileSize);
+            msg.FileSize,
+            EmojiUrl: emojiUrl,
+            CdnUrl: msg.CdnUrl,
+            ThumbUrl: msg.ThumbUrl,
+            Md5: msg.Md5,
+            RawXml: msg.RawXml,
+            FromUserName: msg.FromWxid,
+            ToUserName: msg.ToWxid,
+            TotalLen: msg.TotalLen,
+            CompressType: msg.CompressType,
+            AttachId: msg.AttachId,
+            MediaMsgId: msg.MessageId);
+    }
+
+    public async Task<string?> DownloadImageAsync(
+        BridgeMediaDescriptor descriptor,
+        string targetPath,
+        CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (string.IsNullOrWhiteSpace(targetPath))
+        {
+            return null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(descriptor.LocalPathHint) &&
+            File.Exists(descriptor.LocalPathHint))
+        {
+            try
+            {
+                var dir = Path.GetDirectoryName(targetPath);
+                if (!string.IsNullOrWhiteSpace(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+
+                File.Copy(descriptor.LocalPathHint, targetPath, overwrite: true);
+                return targetPath;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Copy local image hint failed");
+            }
+        }
+
+        try
+        {
+            var dir = Path.GetDirectoryName(targetPath);
+            if (!string.IsNullOrWhiteSpace(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            var request = new DownloadImgRequest
+            {
+                MsgId = descriptor.MessageId,
+                FromUser = descriptor.FromUserName,
+                FromUserName = descriptor.FromUserName,
+                ToUser = descriptor.ToUserName,
+                ToUserName = descriptor.ToUserName,
+                StartPos = 0,
+                TotalLen = descriptor.TotalLen,
+                DataLen = descriptor.TotalLen,
+                CompressType = descriptor.CompressType ?? 0,
+                AttachId = descriptor.AttachId,
+                Path = targetPath
+            };
+
+            await _api.DownloadImgAsync(request, cancellationToken);
+            if (File.Exists(targetPath) && new FileInfo(targetPath).Length > 0)
+            {
+                return targetPath;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "download_img failed for {MessageId}", descriptor.MessageId);
+        }
+
+        return File.Exists(targetPath) && new FileInfo(targetPath).Length > 0 ? targetPath : null;
+    }
 
     private void SetState(WechatConnectionState state)
     {
@@ -979,18 +1066,64 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
 
 public sealed class GroupMemberCache
 {
-    private readonly Dictionary<string, (string Nick, DateTime At)> _cache = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, GroupMemberCacheEntry> _cache = new(StringComparer.Ordinal);
     private readonly object _gate = new();
 
     public bool TryGet(string roomId, string memberWxid, out string? nick)
+        => TryGet(accountId: null, roomId, memberWxid, out nick, out _, out _);
+
+    public bool TryGet(
+        string? accountId,
+        string roomId,
+        string memberWxid,
+        out string? nick,
+        out string? avatarUrl,
+        out string? avatarLocalPath)
     {
         nick = null;
-        var key = $"{roomId}|{memberWxid}";
+        avatarUrl = null;
+        avatarLocalPath = null;
+        var key = BuildKey(accountId, roomId, memberWxid);
         lock (_gate)
         {
             if (_cache.TryGetValue(key, out var item) && DateTime.UtcNow - item.At < TimeSpan.FromHours(6))
             {
-                nick = item.Nick;
+                nick = item.Nickname;
+                avatarUrl = item.AvatarUrl;
+                avatarLocalPath = item.AvatarLocalPath;
+                return true;
+            }
+
+            // Fall back to room|member without account for legacy callers.
+            if (!string.IsNullOrWhiteSpace(accountId))
+            {
+                var legacy = BuildKey(null, roomId, memberWxid);
+                if (_cache.TryGetValue(legacy, out item) && DateTime.UtcNow - item.At < TimeSpan.FromHours(6))
+                {
+                    nick = item.Nickname;
+                    avatarUrl = item.AvatarUrl;
+                    avatarLocalPath = item.AvatarLocalPath;
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    public bool TryGetMember(
+        string accountId,
+        string roomId,
+        string memberWxid,
+        out GroupMemberCacheEntry? member)
+    {
+        member = null;
+        var key = BuildKey(accountId, roomId, memberWxid);
+        lock (_gate)
+        {
+            if (_cache.TryGetValue(key, out var item) && DateTime.UtcNow - item.At < TimeSpan.FromHours(6))
+            {
+                member = item;
                 return true;
             }
         }
@@ -999,11 +1132,26 @@ public sealed class GroupMemberCache
     }
 
     public void Set(string roomId, string memberWxid, string nick)
+        => SetMember(null, roomId, memberWxid, nick, null, null);
+
+    public void SetMember(
+        string? accountId,
+        string roomId,
+        string memberWxid,
+        string? nick,
+        string? avatarUrl = null,
+        string? avatarLocalPath = null)
     {
-        var key = $"{roomId}|{memberWxid}";
+        var key = BuildKey(accountId, roomId, memberWxid);
         lock (_gate)
         {
-            _cache[key] = (nick, DateTime.UtcNow);
+            _cache[key] = new GroupMemberCacheEntry
+            {
+                Nickname = nick ?? string.Empty,
+                AvatarUrl = avatarUrl,
+                AvatarLocalPath = avatarLocalPath,
+                At = DateTime.UtcNow
+            };
         }
     }
 
@@ -1014,4 +1162,17 @@ public sealed class GroupMemberCache
             _cache.Clear();
         }
     }
+
+    private static string BuildKey(string? accountId, string roomId, string memberWxid)
+        => string.IsNullOrWhiteSpace(accountId)
+            ? $"{roomId}|{memberWxid}"
+            : $"{accountId}|{roomId}|{memberWxid}";
+}
+
+public sealed class GroupMemberCacheEntry
+{
+    public string Nickname { get; set; } = string.Empty;
+    public string? AvatarUrl { get; set; }
+    public string? AvatarLocalPath { get; set; }
+    public DateTime At { get; set; }
 }

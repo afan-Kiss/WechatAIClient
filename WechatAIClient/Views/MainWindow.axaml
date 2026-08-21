@@ -290,6 +290,7 @@
                     <controls:Avatar Grid.Column="0"
                                      Initials="{Binding CurrentContact.AvatarInitials}"
                                      AvatarBackground="{Binding CurrentContact.AvatarColor, Converter={StaticResource StringToBrushConverter}}"
+                                     ImagePath="{Binding CurrentContact.AvatarLocalPath}"
                                      Size="40"
                                      VerticalAlignment="Center" />
                     <StackPanel Grid.Column="1"
@@ -369,6 +370,7 @@
                                              IsVisible="{Binding !IsSelf}"
                                              Initials="{Binding SenderInitials}"
                                              AvatarBackground="{Binding SenderAvatarColor, Converter={StaticResource StringToBrushConverter}}"
+                                             ImagePath="{Binding SenderAvatarPath}"
                                              Size="34"
                                              Margin="0,0,10,0"
                                              VerticalAlignment="Top" />
@@ -376,6 +378,7 @@
                                              IsVisible="{Binding IsSelf}"
                                              Initials="{Binding SenderInitials}"
                                              AvatarBackground="{Binding SenderAvatarColor, Converter={StaticResource StringToBrushConverter}}"
+                                             ImagePath="{Binding SenderAvatarPath}"
                                              Size="34"
                                              Margin="10,0,0,0"
                                              VerticalAlignment="Top" />
@@ -452,14 +455,7 @@
                                                      MaxWidth="200"
                                                      HorizontalAlignment="Center" />
                                         </StackPanel>
-                                        <Image Source="{Binding LocalPath}"
-                                               MaxWidth="320"
-                                               MaxHeight="300"
-                                               Stretch="Uniform"
-                                               HorizontalAlignment="Center"
-                                               VerticalAlignment="Center"
-                                               IsVisible="{Binding IsMediaLoaded}" />
-                                        <Image Source="{Binding ImageUrl}"
+                                        <Image Source="{Binding ResolvedMediaPath, Converter={StaticResource PathToBitmapConverter}}"
                                                MaxWidth="320"
                                                MaxHeight="300"
                                                Stretch="Uniform"
@@ -478,12 +474,7 @@
                                                    IsVisible="{Binding IsMediaPlaceholder}"
                                                    Foreground="{DynamicResource TextSecondaryBrush}"
                                                    Margin="8" />
-                                        <Image Source="{Binding LocalPath}"
-                                               MaxWidth="160"
-                                               MaxHeight="160"
-                                               Stretch="Uniform"
-                                               IsVisible="{Binding IsMediaLoaded}" />
-                                        <Image Source="{Binding EmojiUrl}"
+                                        <Image Source="{Binding ResolvedMediaPath, Converter={StaticResource PathToBitmapConverter}}"
                                                MaxWidth="160"
                                                MaxHeight="160"
                                                Stretch="Uniform"
@@ -1136,6 +1127,94 @@
                              FontSize="11"
                              TextWrapping="Wrap"
                              Foreground="{DynamicResource TextMutedBrush}" />
+
+                  <TextBlock Text="微信账号连接"
+                             FontWeight="SemiBold"
+                             Margin="0,12,0,0"
+                             Foreground="{DynamicResource TextBrush}" />
+                  <ItemsControl ItemsSource="{Binding AccountProfileCards}">
+                    <ItemsControl.ItemTemplate>
+                      <DataTemplate x:DataType="vm:AccountProfileCardItem">
+                        <Border Margin="0,0,0,8"
+                                Padding="12"
+                                CornerRadius="10"
+                                Background="{DynamicResource QuoteBackgroundBrush}"
+                                BorderBrush="{DynamicResource GlassBorderBrush}"
+                                BorderThickness="1">
+                          <StackPanel Spacing="6">
+                            <Grid ColumnDefinitions="*,Auto">
+                              <TextBlock Text="{Binding Title}"
+                                         FontWeight="SemiBold"
+                                         Foreground="{DynamicResource TextBrush}"
+                                         TextTrimming="CharacterEllipsis" />
+                              <TextBlock Grid.Column="1"
+                                         Text="{Binding StatusText}"
+                                         FontSize="11"
+                                         Foreground="{DynamicResource TextMutedBrush}" />
+                            </Grid>
+                            <TextBlock Text="{Binding PortsText}"
+                                       FontSize="11"
+                                       Foreground="{DynamicResource TextSecondaryBrush}" />
+                            <TextBlock Text="{Binding Wxid}"
+                                       FontSize="11"
+                                       Foreground="{DynamicResource TextMutedBrush}"
+                                       IsVisible="{Binding Wxid, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                              <Button Classes="glass-button"
+                                      Content="编辑"
+                                      Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).BeginEditAccountProfileCommand}"
+                                      CommandParameter="{Binding}" />
+                              <Button Classes="glass-button"
+                                      Content="{Binding ToggleEnabledLabel}"
+                                      Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).ToggleAccountProfileEnabledCommand}"
+                                      CommandParameter="{Binding}" />
+                              <Button Classes="glass-button"
+                                      Content="删除"
+                                      IsVisible="{Binding CanDelete}"
+                                      Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).DeleteAccountProfileCommand}"
+                                      CommandParameter="{Binding}" />
+                            </StackPanel>
+                          </StackPanel>
+                        </Border>
+                      </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                  </ItemsControl>
+                  <Button Classes="glass-button"
+                          Content="+ 添加账号"
+                          HorizontalAlignment="Stretch"
+                          Command="{Binding BeginAddAccountProfileCommand}" />
+                  <Border IsVisible="{Binding IsEditingAccountProfile}"
+                          Margin="0,4,0,0"
+                          Padding="12"
+                          CornerRadius="10"
+                          Background="{DynamicResource QuoteBackgroundBrush}"
+                          BorderBrush="{DynamicResource AccentBrush}"
+                          BorderThickness="1">
+                    <StackPanel Spacing="8">
+                      <TextBlock Text="编辑账号配置"
+                                 FontWeight="SemiBold"
+                                 Foreground="{DynamicResource TextBrush}" />
+                      <TextBox Watermark="显示名称"
+                               Text="{Binding EditProfileDisplayName}" />
+                      <TextBox Watermark="BaseUrl"
+                               Text="{Binding EditProfileBaseUrl}" />
+                      <Grid ColumnDefinitions="*,*" ColumnSpacing="8">
+                        <TextBox Watermark="HTTP 回调端口"
+                                 Text="{Binding EditProfileHttpPort}" />
+                        <TextBox Grid.Column="1"
+                                 Watermark="TCP 回调端口"
+                                 Text="{Binding EditProfileTcpPort}" />
+                      </Grid>
+                      <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button Classes="glass-button"
+                                Content="保存"
+                                Command="{Binding SaveAccountProfileCommand}" />
+                        <Button Classes="glass-button"
+                                Content="取消"
+                                Command="{Binding CancelEditAccountProfileCommand}" />
+                      </StackPanel>
+                    </StackPanel>
+                  </Border>
 
                   <Border Height="1" Background="{DynamicResource DividerBrush}" Margin="0,8" />
 

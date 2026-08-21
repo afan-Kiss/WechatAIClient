@@ -14,20 +14,27 @@ public partial class MainWindowViewModel : ViewModelBase
 {
     private readonly IThemeService _themeService;
     private readonly IWechatService _wechatService;
+    private readonly IWechatAccountManager _accountManager;
     private readonly IAISettingsService _aiSettings;
     private readonly ISecretStore _secrets;
     private readonly IAIService _aiService;
     private readonly IToastService _toast;
     private readonly ISettingsStore _settingsStore;
+    private readonly IConversationAiCandidateStore _aiCandidates;
     private readonly ILogger<MainWindowViewModel> _logger;
     private readonly Dictionary<string, CancellationTokenSource> _autoDebounce = new(StringComparer.Ordinal);
+    private CancellationTokenSource? _selectionCts;
+    private int _selectionVersion;
     private EventHandler<MessageReceivedEventArgs>? _messageReceivedHandler;
     private EventHandler<WechatConnectionState>? _connectionStateHandler;
+    private EventHandler<AccountConnectionStateChangedEventArgs>? _accountConnectionHandler;
+    private EventHandler<AccountIdentityChangedEventArgs>? _accountIdentityHandler;
+    private EventHandler? _profilesChangedHandler;
     private EventHandler? _toastChangedHandler;
     private EventHandler<Contact>? _contactSelectedHandler;
     private EventHandler? _requestAiAssistHandler;
     private EventHandler<Contact>? _contactPreviewHandler;
-    private EventHandler<string>? _messageSentHandler;
+    private EventHandler<ConversationKey>? _messageSentHandler;
 
     public MainWindowViewModel(
         ContactListViewModel contactList,
@@ -35,11 +42,13 @@ public partial class MainWindowViewModel : ViewModelBase
         AIPanelViewModel aiPanel,
         IThemeService themeService,
         IWechatService wechatService,
+        IWechatAccountManager accountManager,
         IAISettingsService aiSettings,
         ISecretStore secrets,
         IAIService aiService,
         IToastService toast,
         ISettingsStore settingsStore,
+        IConversationAiCandidateStore aiCandidates,
         ILogger<MainWindowViewModel> logger)
     {
         ContactList = contactList;
@@ -47,11 +56,13 @@ public partial class MainWindowViewModel : ViewModelBase
         AiPanel = aiPanel;
         _themeService = themeService;
         _wechatService = wechatService;
+        _accountManager = accountManager;
         _aiSettings = aiSettings;
         _secrets = secrets;
         _aiService = aiService;
         _toast = toast;
         _settingsStore = settingsStore;
+        _aiCandidates = aiCandidates;
         _logger = logger;
         SelectedThemeMode = themeService.CurrentMode;
         RefreshWechatStatus(_wechatService.ConnectionState);
@@ -60,6 +71,7 @@ public partial class MainWindowViewModel : ViewModelBase
         {
             Chat.LoadContactAsync(contact).SafeFireAndForget(_logger);
             AiPanel.BindContactAsync(contact.Id, contact.AccountId).SafeFireAndForget(_logger);
+            RestoreAiCandidate(contact.Key);
         };
         ContactList.ContactSelected += _contactSelectedHandler;
 
@@ -70,12 +82,9 @@ public partial class MainWindowViewModel : ViewModelBase
         _contactPreviewHandler = (_, contact) => ContactList.BumpRecent(contact);
         Chat.ContactPreviewUpdated += _contactPreviewHandler;
 
-        _messageSentHandler = (_, contactId) =>
+        _messageSentHandler = (_, key) =>
         {
-            var contact = ContactList.FindContact(
-                             Chat.CurrentContact?.AccountId,
-                             contactId)
-                         ?? ContactList.FindContact(contactId);
+            var contact = ContactList.FindContact(key.AccountId, key.ConversationId);
             if (contact is not null)
             {
                 ContactList.BumpRecent(contact);
@@ -91,8 +100,31 @@ public partial class MainWindowViewModel : ViewModelBase
             {
                 RefreshWechatStatus(state);
                 Chat.NotifyConnectionStateChanged();
+                RefreshAccountMenu();
+                RefreshAccountProfileCards();
             });
         _wechatService.ConnectionStateChanged += _connectionStateHandler;
+
+        _accountConnectionHandler = (_, _) =>
+            Dispatcher.UIThread.Post(() =>
+            {
+                RefreshAccountMenu();
+                RefreshAccountProfileCards();
+                Chat.NotifyConnectionStateChanged();
+            });
+        _wechatService.AccountConnectionStateChanged += _accountConnectionHandler;
+
+        _accountIdentityHandler = (_, _) =>
+            Dispatcher.UIThread.Post(() =>
+            {
+                RefreshAccountMenu();
+                RefreshAccountProfileCards();
+            });
+        _wechatService.AccountIdentityChanged += _accountIdentityHandler;
+
+        _profilesChangedHandler = (_, _) =>
+            Dispatcher.UIThread.Post(RefreshAccountProfileCards);
+        _accountManager.ProfilesChanged += _profilesChangedHandler;
 
         _toastChangedHandler = (_, _) =>
         {
@@ -215,6 +247,26 @@ public partial class MainWindowViewModel : ViewModelBase
 
     public System.Collections.ObjectModel.ObservableCollection<AccountMenuItem> AccountMenuItems { get; } = [];
 
+    public System.Collections.ObjectModel.ObservableCollection<AccountProfileCardItem> AccountProfileCards { get; } = [];
+
+    [ObservableProperty]
+    private bool _isEditingAccountProfile;
+
+    [ObservableProperty]
+    private string? _editingProfileId;
+
+    [ObservableProperty]
+    private string _editProfileDisplayName = string.Empty;
+
+    [ObservableProperty]
+    private string _editProfileBaseUrl = "http://127.0.0.1:19088";
+
+    [ObservableProperty]
+    private int _editProfileHttpPort = 5000;
+
+    [ObservableProperty]
+    private int _editProfileTcpPort = 61108;
+
     public async Task InitializeAsync()
     {
         try
@@ -223,14 +275,23 @@ public partial class MainWindowViewModel : ViewModelBase
             SelectedThemeMode = _themeService.CurrentMode;
             await LoadAiProviderSettingsAsync();
             await LoadWechatProviderSettingsAsync();
+            await _accountManager.LoadProfilesAsync();
             RefreshWechatStatus(await _wechatService.GetConnectionStateAsync());
             Chat.NotifyConnectionStateChanged();
             RefreshAccountMenu();
+            RefreshAccountProfileCards();
             await ContactList.InitializeAsync();
             await AiPanel.InitializeAsync();
             if (ContactList.SelectedContact is { } selected)
             {
+                await Chat.LoadContactAsync(selected);
                 await AiPanel.BindContactAsync(selected.Id, selected.AccountId);
+                RestoreAiCandidate(selected.Key);
+            }
+            else
+            {
+                Chat.ClearConversation();
+                await AiPanel.BindContactAsync(string.Empty, null);
             }
         }
         catch (Exception ex)
@@ -242,24 +303,90 @@ public partial class MainWindowViewModel : ViewModelBase
     private void RefreshAccountMenu()
     {
         AccountMenuItems.Clear();
+        var accounts = _wechatService.GetAccounts();
+        var connected = accounts.Count(a =>
+            _wechatService.GetAccountConnectionState(a.AccountId) == WechatConnectionState.Connected);
+
         AccountMenuItems.Add(new AccountMenuItem
         {
             AccountId = null,
             Title = "全部账号",
+            Subtitle = accounts.Count == 0 ? null : $"{connected}/{accounts.Count} 已连接",
             IsSelected = _wechatService.SelectedAccountId is null
         });
-        foreach (var account in _wechatService.GetAccounts())
+        foreach (var account in accounts)
         {
+            var state = _wechatService.GetAccountConnectionState(account.AccountId);
             AccountMenuItems.Add(new AccountMenuItem
             {
                 AccountId = account.AccountId,
                 Title = account.DisplayName,
-                Subtitle = account.Wxid,
+                Subtitle = string.IsNullOrWhiteSpace(account.Wxid)
+                    ? FormatConnectionState(state)
+                    : $"{account.Wxid} · {FormatConnectionState(state)}",
                 IsSelected = string.Equals(_wechatService.SelectedAccountId, account.AccountId, StringComparison.Ordinal)
             });
         }
 
         AccountSwitcherText = AccountMenuItems.FirstOrDefault(a => a.IsSelected)?.Title ?? "全部账号";
+    }
+
+    private void RefreshAccountProfileCards()
+    {
+        AccountProfileCards.Clear();
+        foreach (var profile in _accountManager.Profiles)
+        {
+            var session = _accountManager.GetSession(profile.ProfileId)
+                          ?? (!string.IsNullOrWhiteSpace(profile.ExpectedAccountWxid)
+                              ? _accountManager.GetSession(profile.ExpectedAccountWxid)
+                              : null);
+            var identity = session?.Identity;
+            var accountId = identity?.AccountId ?? profile.ExpectedAccountWxid ?? profile.ProfileId;
+            var state = _accountManager.GetAccountConnectionState(accountId);
+            var portHint = ExtractApiPort(profile.BaseUrl);
+            AccountProfileCards.Add(new AccountProfileCardItem
+            {
+                ProfileId = profile.ProfileId,
+                Title = profile.DisplayName,
+                PortsText = $"{portHint} / {profile.HttpCallbackPort} / {profile.TcpCallbackPort}",
+                StatusText = profile.Enabled
+                    ? FormatConnectionState(state)
+                    : "已禁用",
+                Wxid = identity?.Wxid ?? profile.ExpectedAccountWxid,
+                IsEnabled = profile.Enabled,
+                CanDelete = !string.Equals(profile.ProfileId, "default", StringComparison.Ordinal)
+            });
+        }
+    }
+
+    private static string ExtractApiPort(string baseUrl)
+    {
+        if (Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri) && !uri.IsDefaultPort)
+        {
+            return uri.Port.ToString();
+        }
+
+        return "19088";
+    }
+
+    private static string FormatConnectionState(WechatConnectionState state) => state switch
+    {
+        WechatConnectionState.Connected => "● 已连接",
+        WechatConnectionState.Degraded => "⚠ 降级",
+        WechatConnectionState.Connecting => "◐ 连接中",
+        WechatConnectionState.WaitingForLogin => "○ 未登录",
+        WechatConnectionState.WechatNotRunning => "○ Hook 离线",
+        WechatConnectionState.VersionUnsupported => "⚠ 版本不兼容",
+        WechatConnectionState.BridgeError => "⚠ 异常",
+        _ => "○ 未连接"
+    };
+
+    private void RestoreAiCandidate(ConversationKey key)
+    {
+        if (_aiCandidates.TryGet(key, out var content))
+        {
+            AiPanel.LatestGeneratedReply = content;
+        }
     }
 
     [RelayCommand]
@@ -274,17 +401,42 @@ public partial class MainWindowViewModel : ViewModelBase
         }
 
         IsAccountMenuOpen = false;
-        await _wechatService.SelectAccountAsync(item.AccountId);
-        RefreshAccountMenu();
-        await ContactList.InitializeAsync();
-        if (ContactList.SelectedContact is { } selected)
+        _selectionCts?.Cancel();
+        _selectionCts?.Dispose();
+        var cts = new CancellationTokenSource();
+        _selectionCts = cts;
+        var version = Interlocked.Increment(ref _selectionVersion);
+
+        try
         {
-            await Chat.LoadContactAsync(selected);
-            await AiPanel.BindContactAsync(selected.Id, selected.AccountId);
+            await _wechatService.SelectAccountAsync(item.AccountId, cts.Token);
+            if (version != _selectionVersion || cts.IsCancellationRequested)
+            {
+                return;
+            }
+
+            RefreshAccountMenu();
+            await ContactList.InitializeAsync(cts.Token);
+            if (version != _selectionVersion || cts.IsCancellationRequested)
+            {
+                return;
+            }
+
+            if (ContactList.SelectedContact is { } selected)
+            {
+                await Chat.LoadContactAsync(selected);
+                await AiPanel.BindContactAsync(selected.Id, selected.AccountId);
+                RestoreAiCandidate(selected.Key);
+            }
+            else
+            {
+                Chat.ClearConversation();
+                await AiPanel.BindContactAsync(string.Empty, null);
+            }
         }
-        else
+        catch (OperationCanceledException)
         {
-            await AiPanel.BindContactAsync(string.Empty, null);
+            // superseded selection
         }
     }
 
@@ -326,11 +478,33 @@ public partial class MainWindowViewModel : ViewModelBase
             _connectionStateHandler = null;
         }
 
+        if (_accountConnectionHandler is not null)
+        {
+            _wechatService.AccountConnectionStateChanged -= _accountConnectionHandler;
+            _accountConnectionHandler = null;
+        }
+
+        if (_accountIdentityHandler is not null)
+        {
+            _wechatService.AccountIdentityChanged -= _accountIdentityHandler;
+            _accountIdentityHandler = null;
+        }
+
+        if (_profilesChangedHandler is not null)
+        {
+            _accountManager.ProfilesChanged -= _profilesChangedHandler;
+            _profilesChangedHandler = null;
+        }
+
         if (_toastChangedHandler is not null)
         {
             _toast.Changed -= _toastChangedHandler;
             _toastChangedHandler = null;
         }
+
+        _selectionCts?.Cancel();
+        _selectionCts?.Dispose();
+        _selectionCts = null;
 
         foreach (var cts in _autoDebounce.Values)
         {
@@ -383,19 +557,15 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
-    private bool EnsureWechatConnectedForSend()
+    private bool EnsureWechatConnectedForSend(ConversationKey key)
     {
-        if (_wechatService.ConnectionState == WechatConnectionState.Connected)
+        if (_wechatService.CanSend(key))
         {
             return true;
         }
 
-        _ = _toast.ShowAsync(WechatStatusText);
-        if (!string.IsNullOrWhiteSpace(AiPanel.LatestGeneratedReply))
-        {
-            // keep candidate visible
-        }
-
+        var state = _wechatService.GetAccountConnectionState(key.AccountId);
+        _ = _toast.ShowAsync(FormatConnectionState(state));
         return false;
     }
 
@@ -492,7 +662,21 @@ public partial class MainWindowViewModel : ViewModelBase
 
             RefreshWechatStatus(await _wechatService.GetConnectionStateAsync());
             Chat.NotifyConnectionStateChanged();
+            Chat.ClearConversation();
             await ContactList.InitializeAsync();
+            if (ContactList.SelectedContact is { } selected)
+            {
+                await Chat.LoadContactAsync(selected);
+                await AiPanel.BindContactAsync(selected.Id, selected.AccountId);
+                RestoreAiCandidate(selected.Key);
+            }
+            else
+            {
+                await AiPanel.BindContactAsync(string.Empty, null);
+            }
+
+            RefreshAccountMenu();
+            RefreshAccountProfileCards();
             await _toast.ShowAsync(SettingsWechatProvider == WechatProviderKind.Mock
                 ? "已切换到 Mock 微信"
                 : "已切换到真实微信接入");
@@ -650,6 +834,7 @@ public partial class MainWindowViewModel : ViewModelBase
 
         var contact = Chat.CurrentContact;
         var draftRevision = Chat.DraftRevision;
+        var key = contact.Key;
         var accountId = string.IsNullOrWhiteSpace(contact.AccountId)
             ? (_wechatService.SelectedAccountId ?? SqliteStore.LegacyAccountId)
             : contact.AccountId;
@@ -684,16 +869,19 @@ public partial class MainWindowViewModel : ViewModelBase
 
         if (AiPanel.ReplyMode == AIReplyMode.Auto)
         {
-            if (!EnsureWechatConnectedForSend())
+            if (!EnsureWechatConnectedForSend(key))
             {
+                _aiCandidates.Set(key, result.Content);
+                AiPanel.LatestGeneratedReply = result.Content;
                 return;
             }
 
-            await Chat.SendAsync(contact.Id, result.Content, isFromAi: true);
+            await Chat.SendAsync(accountId, contact.Id, result.Content, isFromAi: true);
+            _aiCandidates.Clear(key);
         }
         else if (AiPanel.ReplyMode == AIReplyMode.ManualConfirm)
         {
-            await ApplyManualConfirmResultAsync(contact.Id, result.Content, draftRevision);
+            await ApplyManualConfirmResultAsync(key, result.Content, draftRevision);
         }
     }
 
@@ -730,15 +918,19 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
-    private async Task ApplyManualConfirmResultAsync(string contactId, string reply, int draftRevisionAtStart)
+    private async Task ApplyManualConfirmResultAsync(
+        ConversationKey key,
+        string reply,
+        int draftRevisionAtStart)
     {
-        if (Chat.CurrentContact?.Id != contactId)
+        _aiCandidates.Set(key, reply);
+
+        if (Chat.CurrentContact?.Key != key)
         {
-            AiPanel.LatestGeneratedReply = reply;
             return;
         }
 
-        if (!Chat.TryApplyAiDraft(reply, draftRevisionAtStart))
+        if (!Chat.TryApplyAiDraft(key, reply, draftRevisionAtStart))
         {
             AiPanel.LatestGeneratedReply = reply;
             await _toast.ShowAsync("已生成新候选");
@@ -757,10 +949,10 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
-        if (_wechatService.ConnectionState != WechatConnectionState.Connected &&
+        if (!_wechatService.CanSend(new ConversationKey(e.AccountId, e.ContactId)) &&
             AiPanel.ReplyMode == AIReplyMode.Auto)
         {
-            // Auto must not send while disconnected; Manual can still generate later.
+            // Auto must not send while this account is disconnected; Manual can still generate later.
             return;
         }
 
@@ -864,8 +1056,7 @@ public partial class MainWindowViewModel : ViewModelBase
             var isGroup = contact?.Type == ContactType.Group;
             var replyMode = autoSend ? AIReplyMode.Auto : AIReplyMode.ManualConfirm;
             var draftRevision =
-                Chat.CurrentContact?.Id == contactId &&
-                string.Equals(Chat.CurrentContact?.AccountId, resolvedAccountId, StringComparison.Ordinal)
+                Chat.CurrentContact?.Key == convKey
                     ? Chat.DraftRevision
                     : (int?)null;
             var pins = await _aiSettings.GetPinnedIdsAsync(resolvedAccountId, contactId, cancellationToken);
@@ -885,9 +1076,7 @@ public partial class MainWindowViewModel : ViewModelBase
                 IncludeOwnMessages = effective.IncludeOwnMessages,
                 ReplyStyle = effective.ReplyStyle,
                 ReplyLength = effective.ReplyLength,
-                TemporaryInstruction = string.IsNullOrWhiteSpace(AiPanel.TemporaryInstruction)
-                    ? null
-                    : AiPanel.TemporaryInstruction,
+                TemporaryInstruction = null,
                 PinnedMessageIds = pins,
                 DraftRevisionAtStart = draftRevision,
                 IsGroup = isGroup
@@ -903,22 +1092,32 @@ public partial class MainWindowViewModel : ViewModelBase
 
             if (autoSend)
             {
-                if (!EnsureWechatConnectedForSend())
+                if (!EnsureWechatConnectedForSend(convKey))
                 {
-                    AiPanel.LatestGeneratedReply = result.Content;
+                    _aiCandidates.Set(convKey, result.Content);
+                    if (Chat.CurrentContact?.Key == convKey)
+                    {
+                        AiPanel.LatestGeneratedReply = result.Content;
+                    }
+
                     await _toast.ShowAsync("微信未连接，回复已保留为候选");
                     return;
                 }
 
                 await Chat.SendAsync(resolvedAccountId, contactId, result.Content, isFromAi: true);
+                _aiCandidates.Clear(convKey);
             }
             else if (draftRevision is int rev)
             {
-                await ApplyManualConfirmResultAsync(contactId, result.Content, rev);
+                await ApplyManualConfirmResultAsync(convKey, result.Content, rev);
             }
             else
             {
-                AiPanel.LatestGeneratedReply = result.Content;
+                _aiCandidates.Set(convKey, result.Content);
+                if (Chat.CurrentContact?.Key == convKey)
+                {
+                    AiPanel.LatestGeneratedReply = result.Content;
+                }
             }
         }
         catch (OperationCanceledException)
@@ -930,6 +1129,164 @@ public partial class MainWindowViewModel : ViewModelBase
             _logger.LogError(ex, "Auto AI reply failed for {AccountId}/{ContactId}", accountId, contactId);
         }
     }
+
+    [RelayCommand]
+    private void BeginAddAccountProfile()
+    {
+        var profiles = _accountManager.Profiles;
+        var nextHttp = profiles.Count == 0 ? 5000 : profiles.Max(p => p.HttpCallbackPort) + 1;
+        var nextTcp = profiles.Count == 0 ? 61108 : profiles.Max(p => p.TcpCallbackPort) + 1;
+        var nextApi = 19088 + profiles.Count;
+        EditingProfileId = null;
+        EditProfileDisplayName = $"微信账号 {profiles.Count + 1}";
+        EditProfileBaseUrl = $"http://127.0.0.1:{nextApi}";
+        EditProfileHttpPort = nextHttp;
+        EditProfileTcpPort = nextTcp;
+        IsEditingAccountProfile = true;
+    }
+
+    [RelayCommand]
+    private void BeginEditAccountProfile(AccountProfileCardItem? card)
+    {
+        if (card is null)
+        {
+            return;
+        }
+
+        var profile = _accountManager.Profiles.FirstOrDefault(p =>
+            string.Equals(p.ProfileId, card.ProfileId, StringComparison.Ordinal));
+        if (profile is null)
+        {
+            return;
+        }
+
+        EditingProfileId = profile.ProfileId;
+        EditProfileDisplayName = profile.DisplayName;
+        EditProfileBaseUrl = profile.BaseUrl;
+        EditProfileHttpPort = profile.HttpCallbackPort;
+        EditProfileTcpPort = profile.TcpCallbackPort;
+        IsEditingAccountProfile = true;
+    }
+
+    [RelayCommand]
+    private void CancelEditAccountProfile()
+    {
+        IsEditingAccountProfile = false;
+        EditingProfileId = null;
+    }
+
+    [RelayCommand]
+    private async Task SaveAccountProfileAsync()
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(EditProfileDisplayName))
+            {
+                await _toast.ShowAsync("请填写账号名称");
+                return;
+            }
+
+            if (string.IsNullOrWhiteSpace(EditingProfileId))
+            {
+                var profile = new WechatAccountConnectionProfile(
+                    Guid.NewGuid().ToString("N")[..8],
+                    EditProfileDisplayName.Trim(),
+                    string.IsNullOrWhiteSpace(EditProfileBaseUrl)
+                        ? "http://127.0.0.1:19088"
+                        : EditProfileBaseUrl.Trim(),
+                    EditProfileHttpPort,
+                    EditProfileTcpPort,
+                    null,
+                    true);
+                await _accountManager.AddProfileAsync(profile);
+                await _toast.ShowAsync("已添加账号");
+            }
+            else
+            {
+                var existing = _accountManager.Profiles.FirstOrDefault(p =>
+                    string.Equals(p.ProfileId, EditingProfileId, StringComparison.Ordinal));
+                if (existing is null)
+                {
+                    await _toast.ShowAsync("账号不存在");
+                    return;
+                }
+
+                var updated = existing with
+                {
+                    DisplayName = EditProfileDisplayName.Trim(),
+                    BaseUrl = string.IsNullOrWhiteSpace(EditProfileBaseUrl)
+                        ? existing.BaseUrl
+                        : EditProfileBaseUrl.Trim(),
+                    HttpCallbackPort = EditProfileHttpPort,
+                    TcpCallbackPort = EditProfileTcpPort
+                };
+                await _accountManager.UpdateProfileAsync(updated);
+                await _toast.ShowAsync("已保存账号");
+            }
+
+            IsEditingAccountProfile = false;
+            EditingProfileId = null;
+            RefreshAccountProfileCards();
+            RefreshAccountMenu();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to save account profile");
+            await _toast.ShowAsync(ex.Message.Contains("port", StringComparison.OrdinalIgnoreCase)
+                ? "端口冲突，请修改后重试"
+                : "保存失败");
+        }
+    }
+
+    [RelayCommand]
+    private async Task DeleteAccountProfileAsync(AccountProfileCardItem? card)
+    {
+        if (card is null || !card.CanDelete)
+        {
+            return;
+        }
+
+        try
+        {
+            await _accountManager.DeleteProfileAsync(card.ProfileId);
+            RefreshAccountProfileCards();
+            RefreshAccountMenu();
+            await ContactList.InitializeAsync();
+            if (ContactList.SelectedContact is null)
+            {
+                Chat.ClearConversation();
+            }
+
+            await _toast.ShowAsync("已删除账号");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to delete account profile");
+            await _toast.ShowAsync("删除失败");
+        }
+    }
+
+    [RelayCommand]
+    private async Task ToggleAccountProfileEnabledAsync(AccountProfileCardItem? card)
+    {
+        if (card is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _accountManager.SetProfileEnabledAsync(card.ProfileId, !card.IsEnabled);
+            RefreshAccountProfileCards();
+            RefreshAccountMenu();
+            await _toast.ShowAsync(card.IsEnabled ? "已禁用" : "已启用");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to toggle account profile");
+            await _toast.ShowAsync("操作失败");
+        }
+    }
 }
 
 public sealed class AccountMenuItem
@@ -938,4 +1295,16 @@ public sealed class AccountMenuItem
     public string Title { get; init; } = "";
     public string? Subtitle { get; init; }
     public bool IsSelected { get; init; }
+}
+
+public sealed class AccountProfileCardItem
+{
+    public string ProfileId { get; init; } = "";
+    public string Title { get; init; } = "";
+    public string PortsText { get; init; } = "";
+    public string StatusText { get; init; } = "";
+    public string? Wxid { get; init; }
+    public bool IsEnabled { get; init; }
+    public bool CanDelete { get; init; }
+    public string ToggleEnabledLabel => IsEnabled ? "禁用" : "启用";
 }
