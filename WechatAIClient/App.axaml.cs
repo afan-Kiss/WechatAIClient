@@ -8,6 +8,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using WechatAIClient.Models;
 using WechatAIClient.Services;
+using WechatAIClient.Services.Logging;
 using WechatAIClient.Services.Mock;
 using WechatAIClient.ViewModels;
 using WechatAIClient.Views;
@@ -33,7 +34,11 @@ public partial class App : Application
         Services.GetRequiredService<SqliteStore>().Initialize();
 
         AppDomain.CurrentDomain.UnhandledException += (_, e) =>
-            logger.LogCritical(e.ExceptionObject as Exception, "Unhandled exception");
+        {
+            var ex = e.ExceptionObject as Exception;
+            logger.LogCritical(ex, "Unhandled exception");
+            WriteCrashLog(ex);
+        };
 
         TaskScheduler.UnobservedTaskException += (_, e) =>
         {
@@ -43,19 +48,42 @@ public partial class App : Application
 
         Dispatcher.UIThread.UnhandledException += (_, e) =>
         {
-            logger.LogError(e.Exception, "UI thread exception");
-            e.Handled = true;
+            if (IsRecoverable(e.Exception))
+            {
+                logger.LogWarning(e.Exception, "Recoverable UI exception");
+                e.Handled = true;
+                return;
+            }
+
+            logger.LogCritical(e.Exception, "Fatal UI thread exception");
+            WriteCrashLog(e.Exception);
+            e.Handled = false;
+            if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+            {
+                desktop.Shutdown(1);
+            }
         };
 
         var themeService = Services.GetRequiredService<IThemeService>();
-        ApplyTheme(themeService.CurrentMode);
+        ApplyTheme(themeService.CurrentMode, themeService.ActualIsLight);
         themeService.ThemeChanged += (_, _) =>
-            Dispatcher.UIThread.Post(() => ApplyTheme(themeService.CurrentMode));
+            Dispatcher.UIThread.Post(() => ApplyTheme(themeService.CurrentMode, themeService.ActualIsLight));
 
-        if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        ActualThemeVariantChanged += (_, _) =>
+        {
+            var isLight = ActualThemeVariant == ThemeVariant.Light;
+            themeService.NotifySystemThemeChanged(isLight);
+            if (themeService.CurrentMode == AppThemeMode.System)
+            {
+                Dispatcher.UIThread.Post(() => ApplyTheme(AppThemeMode.System, isLight));
+            }
+        };
+
+        if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktopLifetime)
         {
             var mainVm = Services.GetRequiredService<MainWindowViewModel>();
-            desktop.MainWindow = new MainWindow { DataContext = mainVm };
+            desktopLifetime.MainWindow = new MainWindow { DataContext = mainVm };
+            desktopLifetime.Exit += (_, _) => mainVm.Cleanup();
             _ = mainVm.InitializeAsync();
         }
 
@@ -70,12 +98,19 @@ public partial class App : Application
             builder.SetMinimumLevel(LogLevel.Information);
             builder.AddConsole();
             builder.AddDebug();
+            builder.AddProvider(new FileLoggerProvider());
         });
 
         services.AddSingleton<SqliteStore>();
+        services.AddSingleton<ISettingsStore, SqliteSettingsStore>();
+        services.AddSingleton<ISecretStore, DpapiSecretStore>();
         services.AddSingleton<IThemeService, ThemeService>();
+        services.AddSingleton<IClipboardService, AvaloniaClipboardService>();
+        services.AddSingleton<IToastService, ToastService>();
+        services.AddSingleton<IFilePickerService, AvaloniaFilePickerService>();
         services.AddSingleton<IWechatService, MockWechatService>();
         services.AddSingleton<IAIService, MockAIService>();
+        services.AddSingleton<AIOrchestrator>();
         services.AddSingleton<ContactListViewModel>();
         services.AddSingleton<ChatViewModel>();
         services.AddSingleton<AIPanelViewModel>();
@@ -83,7 +118,7 @@ public partial class App : Application
         return services.BuildServiceProvider();
     }
 
-    private void ApplyTheme(AppThemeMode mode)
+    private void ApplyTheme(AppThemeMode mode, bool actualIsLight)
     {
         RequestedThemeVariant = mode switch
         {
@@ -96,7 +131,7 @@ public partial class App : Application
         {
             AppThemeMode.Light => true,
             AppThemeMode.Dark => false,
-            _ => ActualThemeVariant == ThemeVariant.Light
+            _ => actualIsLight
         };
 
         var themeUri = useLight ? LightThemeUri : DarkThemeUri;
@@ -110,5 +145,34 @@ public partial class App : Application
         }
 
         dictionaries.Insert(0, new ResourceInclude(themeUri) { Source = themeUri });
+    }
+
+    private static bool IsRecoverable(Exception ex)
+    {
+        if (ex is OperationCanceledException or TaskCanceledException or ArgumentException)
+        {
+            return true;
+        }
+
+        return ex is InvalidOperationException ioe
+               && ioe.Message.Contains("SQLite unavailable", StringComparison.Ordinal);
+    }
+
+    private static void WriteCrashLog(Exception? ex)
+    {
+        try
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "WechatAIClient",
+                "Logs");
+            Directory.CreateDirectory(dir);
+            var path = Path.Combine(dir, $"crash-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+            File.WriteAllText(path, ex?.ToString() ?? "Unknown fatal error");
+        }
+        catch
+        {
+            // last resort
+        }
     }
 }

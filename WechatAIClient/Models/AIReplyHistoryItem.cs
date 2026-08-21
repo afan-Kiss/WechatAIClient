@@ -7,4 +7,5 @@ public sealed class AIReplyHistoryItem
     public string Status { get; set; } = "自动回复";
     public string Content { get; set; } = string.Empty;
     public string ContactName { get; set; } = string.Empty;
+    public string ContactId { get; set; } = string.Empty;
 }

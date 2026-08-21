@@ -8,6 +8,7 @@ public sealed class ChatMessage
     public string SenderAvatarColor { get; set; } = "#7C5CFF";
     public string SenderInitials { get; set; } = "?";
     public bool IsSelf { get; set; }
+    public bool IsFromAi { get; set; }
     public MessageType Type { get; set; } = MessageType.Text;
     public string Content { get; set; } = string.Empty;
     public string? ImageUrl { get; set; }

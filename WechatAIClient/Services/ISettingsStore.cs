@@ -1,0 +1,7 @@
+namespace WechatAIClient.Services;
+
+public interface ISettingsStore
+{
+    Task<string?> GetAsync(string key, CancellationToken cancellationToken = default);
+    Task SetAsync(string key, string value, CancellationToken cancellationToken = default);
+}

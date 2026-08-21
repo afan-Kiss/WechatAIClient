@@ -42,7 +42,6 @@
     <Setter Property="Template">
       <ControlTemplate>
         <Border Classes="message-enter"
-                MaxWidth="420"
                 Padding="12,10"
                 CornerRadius="14"
                 Background="{DynamicResource BubbleOtherBrush}">
@@ -57,7 +56,6 @@
     <Setter Property="Template">
       <ControlTemplate>
         <Border Classes="message-enter"
-                MaxWidth="420"
                 Padding="12,10"
                 CornerRadius="14"
                 Background="{DynamicResource SelfBubbleBrush}">

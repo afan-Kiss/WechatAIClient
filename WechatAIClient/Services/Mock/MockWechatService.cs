@@ -4,6 +4,7 @@ namespace WechatAIClient.Services.Mock;
 
 public sealed class MockWechatService : IWechatService
 {
+    private readonly object _gate = new();
     private readonly List<Contact> _contacts;
     private readonly Dictionary<string, List<ChatMessage>> _messages;
 
@@ -223,85 +224,284 @@ public sealed class MockWechatService : IWechatService
         };
     }
 
+    /// <summary>Optional per-contact delay override used by tests.</summary>
+    public Func<string, int>? MessageLoadDelayMs { get; set; }
+
+    public int DelayGetMessagesMs { get; set; }
+    public int DelaySearchMs { get; set; }
+    public bool ThrowOnSend { get; set; }
+
+    public event EventHandler<MessageReceivedEventArgs>? MessageReceived;
+
     public Task<IReadOnlyList<Contact>> GetContactsAsync(CancellationToken cancellationToken = default)
-        => Task.FromResult<IReadOnlyList<Contact>>(_contacts.Where(c => c.Type == ContactType.Friend).ToList());
-
-    public Task<IReadOnlyList<Contact>> GetGroupsAsync(CancellationToken cancellationToken = default)
-        => Task.FromResult<IReadOnlyList<Contact>>(_contacts.Where(c => c.Type == ContactType.Group).ToList());
-
-    public Task<IReadOnlyList<Contact>> GetRecentChatsAsync(CancellationToken cancellationToken = default)
-        => Task.FromResult<IReadOnlyList<Contact>>(_contacts.OrderByDescending(c => c.LastMessageTime).ToList());
-
-    public Task<IReadOnlyList<ChatMessage>> GetMessagesAsync(string contactId, CancellationToken cancellationToken = default)
     {
-        if (_messages.TryGetValue(contactId, out var list))
+        lock (_gate)
         {
-            return Task.FromResult<IReadOnlyList<ChatMessage>>(list.ToList());
+            return Task.FromResult<IReadOnlyList<Contact>>(
+                _contacts.Where(c => c.Type == ContactType.Friend).ToList());
         }
-
-        var contact = _contacts.FirstOrDefault(c => c.Id == contactId);
-        var fallback = new List<ChatMessage>
-        {
-            new()
-            {
-                ContactId = contactId,
-                SenderName = contact?.Name ?? "对方",
-                SenderAvatarColor = contact?.AvatarColor ?? "#7C5CFF",
-                SenderInitials = contact?.AvatarInitials ?? "?",
-                Content = contact?.LastMessage ?? "你好",
-                Timestamp = contact?.LastMessageTime ?? DateTime.Now,
-                ShowTimeSeparator = true,
-                TimeSeparatorText = "今天"
-            }
-        };
-        return Task.FromResult<IReadOnlyList<ChatMessage>>(fallback);
     }
 
-    public Task<ChatMessage> SendMessageAsync(string contactId, string content, MessageType type = MessageType.Text, CancellationToken cancellationToken = default)
+    public Task<IReadOnlyList<Contact>> GetGroupsAsync(CancellationToken cancellationToken = default)
     {
-        var message = new ChatMessage
+        lock (_gate)
         {
-            ContactId = contactId,
-            SenderName = "我",
-            IsSelf = true,
-            SenderAvatarColor = "#7C5CFF",
-            SenderInitials = "我",
-            Type = type,
-            Content = content,
-            Timestamp = DateTime.Now
-        };
+            return Task.FromResult<IReadOnlyList<Contact>>(
+                _contacts.Where(c => c.Type == ContactType.Group).ToList());
+        }
+    }
 
-        if (!_messages.TryGetValue(contactId, out var list))
+    public Task<IReadOnlyList<Contact>> GetRecentChatsAsync(CancellationToken cancellationToken = default)
+    {
+        lock (_gate)
         {
-            list = [];
-            _messages[contactId] = list;
+            return Task.FromResult<IReadOnlyList<Contact>>(
+                _contacts.OrderByDescending(c => c.LastMessageTime).ToList());
+        }
+    }
+
+    public async Task<IReadOnlyList<ChatMessage>> GetMessagesAsync(
+        string contactId,
+        CancellationToken cancellationToken = default)
+    {
+        var delay = MessageLoadDelayMs?.Invoke(contactId) ?? DelayGetMessagesMs;
+        if (delay > 0)
+        {
+            await Task.Delay(delay, cancellationToken);
         }
 
-        list.Add(message);
+        cancellationToken.ThrowIfCancellationRequested();
 
-        var contact = _contacts.FirstOrDefault(c => c.Id == contactId);
-        if (contact is not null)
+        lock (_gate)
         {
-            contact.LastMessage = content;
-            contact.LastSender = "我";
-            contact.LastMessageTime = message.Timestamp;
+            if (_messages.TryGetValue(contactId, out var list))
+            {
+                return list.ToList();
+            }
+
+            var contact = _contacts.FirstOrDefault(c => c.Id == contactId);
+            var fallback = new List<ChatMessage>
+            {
+                new()
+                {
+                    ContactId = contactId,
+                    SenderName = contact?.Name ?? "对方",
+                    SenderAvatarColor = contact?.AvatarColor ?? "#7C5CFF",
+                    SenderInitials = contact?.AvatarInitials ?? "?",
+                    Content = contact?.LastMessage ?? "你好",
+                    Timestamp = contact?.LastMessageTime ?? DateTime.Now,
+                    ShowTimeSeparator = true,
+                    TimeSeparatorText = "今天"
+                }
+            };
+            _messages[contactId] = fallback;
+            return fallback.ToList();
+        }
+    }
+
+    public async Task<IReadOnlyList<SearchHit>> SearchAsync(
+        string keyword,
+        ContactType? tabFilter,
+        CancellationToken cancellationToken = default)
+    {
+        if (DelaySearchMs > 0)
+        {
+            await Task.Delay(DelaySearchMs, cancellationToken);
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        lock (_gate)
+        {
+            IEnumerable<Contact> contacts = _contacts;
+            if (tabFilter is ContactType filter)
+            {
+                contacts = contacts.Where(c => c.Type == filter);
+            }
+
+            if (string.IsNullOrWhiteSpace(keyword))
+            {
+                return contacts
+                    .OrderByDescending(c => c.LastMessageTime)
+                    .Select(c => new SearchHit
+                    {
+                        Contact = c,
+                        MatchSummary = c.LastMessage,
+                        HitKind = c.Type == ContactType.Group ? SearchHitKind.Group : SearchHitKind.Contact
+                    })
+                    .ToList();
+            }
+
+            var hits = new List<SearchHit>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (var contact in contacts)
+            {
+                if (contact.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                {
+                    hits.Add(new SearchHit
+                    {
+                        Contact = contact,
+                        MatchSummary = contact.Name,
+                        HitKind = contact.Type == ContactType.Group ? SearchHitKind.Group : SearchHitKind.Contact
+                    });
+                    seen.Add(contact.Id);
+                }
+            }
+
+            foreach (var contact in contacts)
+            {
+                if (!_messages.TryGetValue(contact.Id, out var messages))
+                {
+                    continue;
+                }
+
+                var match = messages.LastOrDefault(m =>
+                    m.Content.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+                if (match is null)
+                {
+                    continue;
+                }
+
+                if (!seen.Add(contact.Id))
+                {
+                    // already matched by name; keep message summary if richer
+                    continue;
+                }
+
+                hits.Add(new SearchHit
+                {
+                    Contact = contact,
+                    MatchSummary = match.Content,
+                    HitKind = SearchHitKind.Message
+                });
+            }
+
+            // also match last message preview when no transcript loaded
+            foreach (var contact in contacts)
+            {
+                if (seen.Contains(contact.Id))
+                {
+                    continue;
+                }
+
+                if (contact.LastMessage.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+                {
+                    hits.Add(new SearchHit
+                    {
+                        Contact = contact,
+                        MatchSummary = contact.LastMessage,
+                        HitKind = SearchHitKind.Message
+                    });
+                }
+            }
+
+            return hits;
+        }
+    }
+
+    public Task<ChatMessage> SendMessageAsync(
+        string contactId,
+        string content,
+        MessageType type = MessageType.Text,
+        string? fileName = null,
+        string? fileSize = null,
+        string? imagePath = null,
+        bool isFromAi = false,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (ThrowOnSend)
+        {
+            throw new InvalidOperationException("Mock send failure");
+        }
+
+        ChatMessage message;
+        lock (_gate)
+        {
+            message = new ChatMessage
+            {
+                ContactId = contactId,
+                SenderName = isFromAi ? "AI 助手" : "我",
+                IsSelf = true,
+                IsFromAi = isFromAi,
+                SenderAvatarColor = "#7C5CFF",
+                SenderInitials = isFromAi ? "AI" : "我",
+                Type = type,
+                Content = content,
+                FileName = fileName,
+                FileSize = fileSize,
+                ImageUrl = imagePath,
+                Timestamp = DateTime.Now
+            };
+
+            if (!_messages.TryGetValue(contactId, out var list))
+            {
+                list = [];
+                _messages[contactId] = list;
+            }
+
+            list.Add(message);
+            UpdateContactPreview(contactId, content, message.SenderName, message.Timestamp);
         }
 
         return Task.FromResult(message);
     }
 
-    public Task<IReadOnlyList<Contact>> SearchAsync(string keyword, CancellationToken cancellationToken = default)
+    public Task SimulateIncomingMessageAsync(
+        string contactId,
+        string content,
+        CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrWhiteSpace(keyword))
+        cancellationToken.ThrowIfCancellationRequested();
+
+        ChatMessage message;
+        lock (_gate)
         {
-            return GetRecentChatsAsync(cancellationToken);
+            var contact = _contacts.FirstOrDefault(c => c.Id == contactId);
+            message = new ChatMessage
+            {
+                ContactId = contactId,
+                SenderName = contact?.Name ?? "对方",
+                SenderAvatarColor = contact?.AvatarColor ?? "#7C5CFF",
+                SenderInitials = contact?.AvatarInitials ?? "?",
+                Content = content,
+                Timestamp = DateTime.Now,
+                IsSelf = false,
+                IsFromAi = false
+            };
+
+            if (!_messages.TryGetValue(contactId, out var list))
+            {
+                list = [];
+                _messages[contactId] = list;
+            }
+
+            list.Add(message);
+            UpdateContactPreview(contactId, content, message.SenderName, message.Timestamp);
         }
 
-        var result = _contacts
-            .Where(c =>
-                c.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
-                c.LastMessage.Contains(keyword, StringComparison.OrdinalIgnoreCase))
-            .ToList();
-        return Task.FromResult<IReadOnlyList<Contact>>(result);
+        MessageReceived?.Invoke(this, new MessageReceivedEventArgs
+        {
+            ContactId = contactId,
+            MessageId = message.Id,
+            Message = message,
+            Timestamp = message.Timestamp
+        });
+
+        return Task.CompletedTask;
+    }
+
+    private void UpdateContactPreview(string contactId, string content, string sender, DateTime timestamp)
+    {
+        var contact = _contacts.FirstOrDefault(c => c.Id == contactId);
+        if (contact is null)
+        {
+            return;
+        }
+
+        contact.LastMessage = content;
+        contact.LastSender = sender;
+        contact.LastMessageTime = timestamp;
     }
 }

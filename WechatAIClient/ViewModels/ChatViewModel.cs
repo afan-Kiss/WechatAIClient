@@ -1,7 +1,9 @@
 using System.Collections.ObjectModel;
+using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.Extensions.Logging;
+using WechatAIClient.Helpers;
 using WechatAIClient.Models;
 using WechatAIClient.Services;
 
@@ -10,12 +12,26 @@ namespace WechatAIClient.ViewModels;
 public partial class ChatViewModel : ViewModelBase
 {
     private readonly IWechatService _wechatService;
+    private readonly IFilePickerService _filePicker;
+    private readonly IToastService _toast;
     private readonly ILogger<ChatViewModel> _logger;
+    private CancellationTokenSource? _loadCts;
+    private int _loadVersion;
+    private EventHandler<MessageReceivedEventArgs>? _messageReceivedHandler;
 
-    public ChatViewModel(IWechatService wechatService, ILogger<ChatViewModel> logger)
+    public ChatViewModel(
+        IWechatService wechatService,
+        IFilePickerService filePicker,
+        IToastService toast,
+        ILogger<ChatViewModel> logger)
     {
         _wechatService = wechatService;
+        _filePicker = filePicker;
+        _toast = toast;
         _logger = logger;
+
+        _messageReceivedHandler = OnMessageReceived;
+        _wechatService.MessageReceived += _messageReceivedHandler;
     }
 
     public ObservableCollection<ChatMessage> Messages { get; } = [];
@@ -24,35 +40,83 @@ public partial class ChatViewModel : ViewModelBase
     private Contact? _currentContact;
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(CanSend))]
     private string _draftText = string.Empty;
 
     [ObservableProperty]
     private bool _isAiAssistantActive;
 
+    [ObservableProperty]
+    [NotifyCanExecuteChangedFor(nameof(SendCommand))]
+    private bool _isSending;
+
+    [ObservableProperty]
+    private bool _isNearBottom = true;
+
+    [ObservableProperty]
+    private bool _keepAtBottom = true;
+
+    [ObservableProperty]
+    private double _bubbleMaxWidth = 420;
+
+    [ObservableProperty]
+    private bool _isEmojiPickerOpen;
+
+    public bool CanSend =>
+        !IsSending &&
+        CurrentContact is not null &&
+        !string.IsNullOrWhiteSpace(DraftText);
+
+    public event EventHandler<ChatMessagesChangedEventArgs>? MessagesChanged;
     public event EventHandler? MessagesUpdated;
     public event EventHandler? RequestAiAssist;
+    public event EventHandler<string>? MessageSent;
+    public event EventHandler<Contact>? ContactPreviewUpdated;
 
     public async Task LoadContactAsync(Contact contact)
     {
+        ArgumentNullException.ThrowIfNull(contact);
+
+        _loadCts?.Cancel();
+        _loadCts?.Dispose();
+        var cts = new CancellationTokenSource();
+        _loadCts = cts;
+        var version = Interlocked.Increment(ref _loadVersion);
+        var contactId = contact.Id;
+
         CurrentContact = contact;
+        contact.UnreadCount = 0;
         Messages.Clear();
+        IsEmojiPickerOpen = false;
+        NotifyCanSendChanged();
+
         try
         {
-            var messages = await _wechatService.GetMessagesAsync(contact.Id);
+            var messages = await _wechatService.GetMessagesAsync(contactId, cts.Token);
+            if (version != _loadVersion || CurrentContact?.Id != contactId || cts.IsCancellationRequested)
+            {
+                return;
+            }
+
+            Messages.Clear();
             foreach (var message in messages)
             {
                 Messages.Add(message);
             }
 
-            MessagesUpdated?.Invoke(this, EventArgs.Empty);
+            RaiseMessagesChanged(contactId, forceScroll: true);
+        }
+        catch (OperationCanceledException)
+        {
+            // superseded load
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to load messages for {ContactId}", contact.Id);
+            _logger.LogError(ex, "Failed to load messages for {ContactId}", contactId);
         }
     }
 
-    [RelayCommand]
+    [RelayCommand(CanExecute = nameof(CanSend))]
     private async Task SendAsync()
     {
         if (CurrentContact is null || string.IsNullOrWhiteSpace(DraftText))
@@ -60,21 +124,158 @@ public partial class ChatViewModel : ViewModelBase
             return;
         }
 
+        var targetContactId = CurrentContact.Id;
+        var pending = DraftText.Trim();
+        DraftText = string.Empty;
+        IsSending = true;
+
         try
         {
-            var content = DraftText.Trim();
-            DraftText = string.Empty;
-            var message = await _wechatService.SendMessageAsync(CurrentContact.Id, content);
-            Messages.Add(message);
-            CurrentContact.LastMessage = content;
-            CurrentContact.LastMessageTime = message.Timestamp;
-            MessagesUpdated?.Invoke(this, EventArgs.Empty);
+            var message = await _wechatService.SendMessageAsync(targetContactId, pending);
+            if (CurrentContact?.Id == targetContactId)
+            {
+                Messages.Add(message);
+                RaiseMessagesChanged(targetContactId, forceScroll: true);
+            }
+
+            UpdateContactPreview(targetContactId, pending, "我", message.Timestamp);
+            MessageSent?.Invoke(this, targetContactId);
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to send message");
+            if (CurrentContact?.Id == targetContactId && string.IsNullOrEmpty(DraftText))
+            {
+                DraftText = pending;
+            }
+
+            await _toast.ShowAsync("发送失败");
+        }
+        finally
+        {
+            IsSending = false;
         }
     }
+
+    public async Task SendAsync(string contactId, string content, bool isFromAi = false)
+    {
+        if (string.IsNullOrWhiteSpace(contactId) || string.IsNullOrWhiteSpace(content))
+        {
+            return;
+        }
+
+        try
+        {
+            var message = await _wechatService.SendMessageAsync(
+                contactId,
+                content.Trim(),
+                MessageType.Text,
+                isFromAi: isFromAi);
+
+            if (CurrentContact?.Id == contactId)
+            {
+                Messages.Add(message);
+                RaiseMessagesChanged(contactId, forceScroll: IsNearBottom || KeepAtBottom);
+            }
+
+            UpdateContactPreview(contactId, content.Trim(), message.SenderName, message.Timestamp);
+            MessageSent?.Invoke(this, contactId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to send message to {ContactId}", contactId);
+            throw;
+        }
+    }
+
+    [RelayCommand]
+    private async Task SendImageAsync()
+    {
+        if (CurrentContact is null)
+        {
+            return;
+        }
+
+        var path = await _filePicker.PickImageAsync();
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        var targetContactId = CurrentContact.Id;
+        var fileName = Path.GetFileName(path);
+        var message = await _wechatService.SendMessageAsync(
+            targetContactId,
+            "[图片]",
+            MessageType.Image,
+            fileName: fileName,
+            imagePath: path);
+
+        if (CurrentContact?.Id == targetContactId)
+        {
+            Messages.Add(message);
+            RaiseMessagesChanged(targetContactId, forceScroll: true);
+        }
+
+        UpdateContactPreview(targetContactId, "[图片]", "我", message.Timestamp);
+        MessageSent?.Invoke(this, targetContactId);
+    }
+
+    [RelayCommand]
+    private async Task SendFileAsync()
+    {
+        if (CurrentContact is null)
+        {
+            return;
+        }
+
+        var path = await _filePicker.PickFileAsync();
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        var targetContactId = CurrentContact.Id;
+        var fileName = Path.GetFileName(path);
+        var fileInfo = new FileInfo(path);
+        var sizeText = FormatSize(fileInfo.Exists ? fileInfo.Length : 0);
+        var message = await _wechatService.SendMessageAsync(
+            targetContactId,
+            "[文件]",
+            MessageType.File,
+            fileName: fileName,
+            fileSize: sizeText);
+
+        if (CurrentContact?.Id == targetContactId)
+        {
+            Messages.Add(message);
+            RaiseMessagesChanged(targetContactId, forceScroll: true);
+        }
+
+        UpdateContactPreview(targetContactId, $"文件已发送：{fileName}", "我", message.Timestamp);
+        MessageSent?.Invoke(this, targetContactId);
+    }
+
+    [RelayCommand]
+    private void ToggleEmojiPicker() => IsEmojiPickerOpen = !IsEmojiPickerOpen;
+
+    [RelayCommand]
+    private void InsertEmoji(string? emoji)
+    {
+        if (string.IsNullOrEmpty(emoji))
+        {
+            return;
+        }
+
+        DraftText += emoji;
+        IsEmojiPickerOpen = false;
+    }
+
+    [RelayCommand]
+    private void PickImage() => SendImageAsync().SafeFireAndForget(_logger);
+
+    [RelayCommand]
+    private void PickFile() => SendFileAsync().SafeFireAndForget(_logger);
 
     [RelayCommand]
     private void ToggleAiAssistant()
@@ -83,23 +284,81 @@ public partial class ChatViewModel : ViewModelBase
         RequestAiAssist?.Invoke(this, EventArgs.Empty);
     }
 
-    public void AppendIncomingMock(string content)
+    public void Cleanup()
     {
-        if (CurrentContact is null)
+        if (_messageReceivedHandler is not null)
         {
-            return;
+            _wechatService.MessageReceived -= _messageReceivedHandler;
+            _messageReceivedHandler = null;
         }
 
-        var message = new ChatMessage
+        _loadCts?.Cancel();
+        _loadCts?.Dispose();
+        _loadCts = null;
+    }
+
+    partial void OnDraftTextChanged(string value) => NotifyCanSendChanged();
+
+    partial void OnCurrentContactChanged(Contact? value) => NotifyCanSendChanged();
+
+    private void NotifyCanSendChanged()
+    {
+        OnPropertyChanged(nameof(CanSend));
+        SendCommand.NotifyCanExecuteChanged();
+    }
+
+    private void OnMessageReceived(object? sender, MessageReceivedEventArgs e)
+    {
+        Dispatcher.UIThread.Post(() =>
         {
-            ContactId = CurrentContact.Id,
-            SenderName = CurrentContact.Name,
-            SenderAvatarColor = CurrentContact.AvatarColor,
-            SenderInitials = CurrentContact.AvatarInitials,
-            Content = content,
-            Timestamp = DateTime.Now
-        };
-        Messages.Add(message);
+            if (CurrentContact?.Id != e.ContactId)
+            {
+                return;
+            }
+
+            CurrentContact.LastMessage = e.Message.Content;
+            CurrentContact.LastSender = e.Message.SenderName;
+            CurrentContact.LastMessageTime = e.Message.Timestamp;
+            CurrentContact.UnreadCount = 0;
+            ContactPreviewUpdated?.Invoke(this, CurrentContact);
+
+            if (Messages.All(m => m.Id != e.Message.Id))
+            {
+                Messages.Add(e.Message);
+                RaiseMessagesChanged(e.ContactId, forceScroll: IsNearBottom || KeepAtBottom);
+            }
+        });
+    }
+
+    private void UpdateContactPreview(string contactId, string content, string sender, DateTime timestamp)
+    {
+        if (CurrentContact?.Id == contactId)
+        {
+            CurrentContact.LastMessage = content;
+            CurrentContact.LastSender = sender;
+            CurrentContact.LastMessageTime = timestamp;
+            ContactPreviewUpdated?.Invoke(this, CurrentContact);
+        }
+    }
+
+    private void RaiseMessagesChanged(string contactId, bool forceScroll)
+    {
+        MessagesChanged?.Invoke(this, new ChatMessagesChangedEventArgs(contactId, forceScroll));
         MessagesUpdated?.Invoke(this, EventArgs.Empty);
+    }
+
+    private static string FormatSize(long bytes)
+    {
+        if (bytes < 1024)
+        {
+            return $"{bytes} B";
+        }
+
+        if (bytes < 1024 * 1024)
+        {
+            return $"{bytes / 1024.0:0.#} KB";
+        }
+
+        return $"{bytes / (1024.0 * 1024.0):0.#} MB";
     }
 }

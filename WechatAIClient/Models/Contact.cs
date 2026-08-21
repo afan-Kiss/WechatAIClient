@@ -1,16 +1,41 @@
+using CommunityToolkit.Mvvm.ComponentModel;
+
 namespace WechatAIClient.Models;
 
-public sealed class Contact
+public partial class Contact : ObservableObject
 {
     public string Id { get; set; } = string.Empty;
-    public string Name { get; set; } = string.Empty;
-    public string AvatarColor { get; set; } = "#7C5CFF";
-    public string AvatarInitials { get; set; } = "?";
-    public ContactType Type { get; set; } = ContactType.Friend;
-    public string LastMessage { get; set; } = string.Empty;
-    public string LastSender { get; set; } = string.Empty;
-    public DateTime LastMessageTime { get; set; } = DateTime.Now;
-    public int UnreadCount { get; set; }
-    public bool IsOnline { get; set; }
-    public int MemberCount { get; set; }
+
+    [ObservableProperty]
+    private string _name = string.Empty;
+
+    [ObservableProperty]
+    private string _avatarColor = "#7C5CFF";
+
+    [ObservableProperty]
+    private string _avatarInitials = "?";
+
+    [ObservableProperty]
+    private ContactType _type = ContactType.Friend;
+
+    [ObservableProperty]
+    private string _lastMessage = string.Empty;
+
+    [ObservableProperty]
+    private string _lastSender = string.Empty;
+
+    [ObservableProperty]
+    private DateTime _lastMessageTime = DateTime.Now;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(UnreadDisplay))]
+    private int _unreadCount;
+
+    [ObservableProperty]
+    private bool _isOnline;
+
+    [ObservableProperty]
+    private int _memberCount;
+
+    public string UnreadDisplay => UnreadCount > 99 ? "99+" : UnreadCount.ToString();
 }

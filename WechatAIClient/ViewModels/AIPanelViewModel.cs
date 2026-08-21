@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.Extensions.Logging;
@@ -9,12 +10,33 @@ namespace WechatAIClient.ViewModels;
 
 public partial class AIPanelViewModel : ViewModelBase
 {
+    private const string ReplyModeKey = "ai.replyMode";
+    private const string ContextLengthKey = "ai.contextLength";
+    private const string AutoGenerateKey = "ai.autoGenerateOnReceive";
+
     private readonly IAIService _aiService;
+    private readonly AIOrchestrator _orchestrator;
+    private readonly IClipboardService _clipboard;
+    private readonly IToastService _toast;
+    private readonly ISettingsStore _settings;
+    private readonly SqliteStore _sqlite;
     private readonly ILogger<AIPanelViewModel> _logger;
 
-    public AIPanelViewModel(IAIService aiService, ILogger<AIPanelViewModel> logger)
+    public AIPanelViewModel(
+        IAIService aiService,
+        AIOrchestrator orchestrator,
+        IClipboardService clipboard,
+        IToastService toast,
+        ISettingsStore settings,
+        SqliteStore sqlite,
+        ILogger<AIPanelViewModel> logger)
     {
         _aiService = aiService;
+        _orchestrator = orchestrator;
+        _clipboard = clipboard;
+        _toast = toast;
+        _settings = settings;
+        _sqlite = sqlite;
         _logger = logger;
         ModelName = aiService.ModelName;
     }
@@ -62,29 +84,35 @@ public partial class AIPanelViewModel : ViewModelBase
 
     public async Task InitializeAsync()
     {
+        await RestoreSettingsAsync();
         await _aiService.ConnectAsync();
         IsConnected = _aiService.IsConnected;
-        ReplyHistory.Add(new AIReplyHistoryItem
+
+        var history = await _sqlite.GetHistoryAsync(200);
+        ReplyHistory.Clear();
+        foreach (var item in history)
         {
-            Timestamp = DateTime.Today.AddHours(10).AddMinutes(18),
-            Status = "自动回复",
-            Content = "收到，这个方案整体方向很清晰，我建议先把核心交互流程定下来。",
-            ContactName = "产品设计交流组"
-        });
-        ReplyHistory.Add(new AIReplyHistoryItem
+            ReplyHistory.Add(item);
+        }
+    }
+
+    [RelayCommand]
+    private async Task ConnectAsync()
+    {
+        try
         {
-            Timestamp = DateTime.Today.AddHours(9).AddMinutes(52),
-            Status = "手动确认",
-            Content = "可以的。我稍后整理一版更简洁的回复，方便你直接发送。",
-            ContactName = "李明远"
-        });
-        ReplyHistory.Add(new AIReplyHistoryItem
+            await _aiService.ConnectAsync();
+            IsConnected = _aiService.IsConnected;
+            if (IsConnected)
+            {
+                await _toast.ShowAsync("AI 已连接");
+            }
+        }
+        catch (Exception ex)
         {
-            Timestamp = DateTime.Today.AddHours(9).AddMinutes(20),
-            Status = "自动回复",
-            Content = "理解你的意思了。当前上下文里大家都认可深色玻璃拟态。",
-            ContactName = "前端研发小队"
-        });
+            _logger.LogError(ex, "AI connect failed");
+            await _toast.ShowAsync("连接失败");
+        }
     }
 
     [RelayCommand]
@@ -108,7 +136,7 @@ public partial class AIPanelViewModel : ViewModelBase
     }
 
     [RelayCommand]
-    private void CopyReply(AIReplyHistoryItem? item)
+    private async Task CopyReplyAsync(AIReplyHistoryItem? item)
     {
         if (item is null)
         {
@@ -116,38 +144,78 @@ public partial class AIPanelViewModel : ViewModelBase
         }
 
         LatestGeneratedReply = item.Content;
-        _logger.LogInformation("Copied AI reply {Id}", item.Id);
+        await _clipboard.SetTextAsync(item.Content);
+        await _toast.ShowAsync("已复制");
     }
 
-    public async Task<string?> GenerateReplyAsync(IReadOnlyList<ChatMessage> messages, string contactName)
+    [RelayCommand]
+    private async Task ClearHistoryAsync()
     {
+        await _sqlite.ClearHistoryAsync();
+        ReplyHistory.Clear();
+        await _toast.ShowAsync("历史已清空");
+    }
+
+    public Task<string?> GenerateReplyAsync(IReadOnlyList<ChatMessage> messages, string contactName)
+        => GenerateForContactAsync(new AIGenerationRequest
+        {
+            ContactId = string.Empty,
+            ContactName = contactName,
+            ContextSnapshot = messages.ToList(),
+            ContextLength = ContextLength,
+            ReplyMode = ReplyMode
+        });
+
+    public async Task<string?> GenerateForContactAsync(AIGenerationRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+
         if (ReplyMode == AIReplyMode.Off)
         {
+            await _toast.ShowAsync("AI 已关闭");
             return null;
         }
+
+        request.ContextLength = ContextLength;
+        request.ReplyMode = ReplyMode;
 
         try
         {
             IsGenerating = true;
             TypingPreview = string.Empty;
-            var context = messages.TakeLast(ContextLength).ToList();
-            var reply = await _aiService.GenerateReplyAsync(context);
-            await AnimateTypingAsync(reply);
+
+            var result = await _orchestrator.GenerateAsync(
+                request,
+                chunk => Dispatcher.UIThread.Post(() => TypingPreview = chunk));
+
+            if (result is null)
+            {
+                return null;
+            }
 
             var history = new AIReplyHistoryItem
             {
                 Timestamp = DateTime.Now,
                 Status = ReplyMode == AIReplyMode.Auto ? "自动回复" : "手动确认",
-                Content = reply,
-                ContactName = contactName
+                Content = result.Content,
+                ContactName = request.ContactName,
+                ContactId = request.ContactId
             };
+
             ReplyHistory.Insert(0, history);
-            LatestGeneratedReply = reply;
-            return reply;
+            while (ReplyHistory.Count > 200)
+            {
+                ReplyHistory.RemoveAt(ReplyHistory.Count - 1);
+            }
+
+            await _sqlite.InsertHistoryAsync(history);
+            LatestGeneratedReply = result.Content;
+            return result.Content;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "AI generate failed");
+            await _toast.ShowAsync("生成失败");
             return null;
         }
         finally
@@ -159,38 +227,76 @@ public partial class AIPanelViewModel : ViewModelBase
     [RelayCommand]
     private async Task RegenerateAsync()
     {
-        if (LatestGeneratedReply is null)
+        var last = _orchestrator.LastRequest;
+        if (last is null)
         {
+            await _toast.ShowAsync("没有可重新生成的上下文");
             return;
         }
 
-        IsGenerating = true;
-        try
+        var request = new AIGenerationRequest
         {
-            var reply = await _aiService.GenerateReplyAsync([]);
-            await AnimateTypingAsync(reply);
-            LatestGeneratedReply = reply;
-            ReplyHistory.Insert(0, new AIReplyHistoryItem
-            {
-                Timestamp = DateTime.Now,
-                Status = "重新生成",
-                Content = reply,
-                ContactName = "当前会话"
-            });
-        }
-        finally
+            GenerationId = Guid.NewGuid().ToString("N"),
+            ContactId = last.ContactId,
+            ContactName = last.ContactName,
+            ContextSnapshot = last.ContextSnapshot.ToList(),
+            ContextLength = ContextLength,
+            ReplyMode = ReplyMode
+        };
+
+        var reply = await GenerateForContactAsync(request);
+        if (reply is not null && ReplyHistory.Count > 0)
         {
-            IsGenerating = false;
+            ReplyHistory[0].Status = "重新生成";
         }
     }
 
-    private async Task AnimateTypingAsync(string text)
+    partial void OnReplyModeChanged(AIReplyMode value)
+        => _ = PersistAsync(ReplyModeKey, value.ToString());
+
+    partial void OnContextLengthChanged(int value)
+        => _ = PersistAsync(ContextLengthKey, value.ToString());
+
+    partial void OnAutoGenerateOnReceiveChanged(bool value)
+        => _ = PersistAsync(AutoGenerateKey, value ? "1" : "0");
+
+    private async Task RestoreSettingsAsync()
     {
-        TypingPreview = string.Empty;
-        foreach (var ch in text)
+        try
         {
-            TypingPreview += ch;
-            await Task.Delay(12);
+            var mode = await _settings.GetAsync(ReplyModeKey);
+            if (Enum.TryParse<AIReplyMode>(mode, true, out var parsed))
+            {
+                ReplyMode = parsed;
+            }
+
+            var length = await _settings.GetAsync(ContextLengthKey);
+            if (int.TryParse(length, out var contextLength))
+            {
+                ContextLength = contextLength;
+            }
+
+            var auto = await _settings.GetAsync(AutoGenerateKey);
+            if (auto is "0" or "1")
+            {
+                AutoGenerateOnReceive = auto == "1";
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to restore AI settings");
+        }
+    }
+
+    private async Task PersistAsync(string key, string value)
+    {
+        try
+        {
+            await _settings.SetAsync(key, value);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to persist setting {Key}", key);
         }
     }
 }

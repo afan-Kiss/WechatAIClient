@@ -26,16 +26,25 @@ public sealed class MockAIService : IAIService
 
     public Task ConnectAsync(CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         IsConnected = true;
         _logger.LogInformation("Mock AI service connected: {Model}", ModelName);
         return Task.CompletedTask;
     }
 
-    public async Task<string> GenerateReplyAsync(IReadOnlyList<ChatMessage> context, CancellationToken cancellationToken = default)
+    public async Task<string> GenerateReplyAsync(
+        IReadOnlyList<ChatMessage> context,
+        CancellationToken cancellationToken = default)
     {
-        await Task.Delay(900, cancellationToken);
-        var seed = context.Count == 0 ? 0 : Math.Abs(context[^1].Content.GetHashCode());
+        await Task.Delay(700, cancellationToken);
+
+        var seed = context.Count == 0
+            ? Random.Shared.Next()
+            : Math.Abs(context[^1].Content.GetHashCode(StringComparison.Ordinal));
         var reply = _templates[seed % _templates.Length];
+
+        // Chunk-friendly pause so orchestrator typing animation stays responsive to cancel.
+        await Task.Delay(120, cancellationToken);
         _logger.LogInformation("Generated mock AI reply with {Count} context messages", context.Count);
         return reply;
     }

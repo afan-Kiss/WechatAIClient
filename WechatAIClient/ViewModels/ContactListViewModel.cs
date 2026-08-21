@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.Extensions.Logging;
@@ -14,11 +15,16 @@ public partial class ContactListViewModel : ViewModelBase
     private List<Contact> _allRecent = [];
     private List<Contact> _friends = [];
     private List<Contact> _groups = [];
+    private CancellationTokenSource? _searchCts;
+    private int _searchVersion;
+    private EventHandler<MessageReceivedEventArgs>? _messageReceivedHandler;
 
     public ContactListViewModel(IWechatService wechatService, ILogger<ContactListViewModel> logger)
     {
         _wechatService = wechatService;
         _logger = logger;
+        _messageReceivedHandler = OnMessageReceived;
+        _wechatService.MessageReceived += _messageReceivedHandler;
     }
 
     public ObservableCollection<Contact> VisibleContacts { get; } = [];
@@ -53,16 +59,104 @@ public partial class ContactListViewModel : ViewModelBase
         }
     }
 
-    partial void OnSearchTextChanged(string value) => _ = SearchAsync(value);
+    public Contact? FindContact(string contactId)
+    {
+        return _allRecent.FirstOrDefault(c => c.Id == contactId)
+               ?? _friends.FirstOrDefault(c => c.Id == contactId)
+               ?? _groups.FirstOrDefault(c => c.Id == contactId)
+               ?? VisibleContacts.FirstOrDefault(c => c.Id == contactId);
+    }
 
-    partial void OnSelectedTabIndexChanged(int value) => RefreshVisible();
+    public void BumpRecent(Contact contact)
+    {
+        ArgumentNullException.ThrowIfNull(contact);
+
+        _allRecent.RemoveAll(c => c.Id == contact.Id);
+        _allRecent.Insert(0, contact);
+        _allRecent = _allRecent
+            .OrderByDescending(c => c.LastMessageTime)
+            .ToList();
+
+        if (SelectedTabIndex == 0 && string.IsNullOrWhiteSpace(SearchText))
+        {
+            RefreshVisible();
+        }
+    }
+
+    public void ClearUnread(Contact contact)
+    {
+        if (contact is null)
+        {
+            return;
+        }
+
+        contact.UnreadCount = 0;
+    }
+
+    public void Cleanup()
+    {
+        if (_messageReceivedHandler is not null)
+        {
+            _wechatService.MessageReceived -= _messageReceivedHandler;
+            _messageReceivedHandler = null;
+        }
+
+        _searchCts?.Cancel();
+        _searchCts?.Dispose();
+        _searchCts = null;
+    }
+
+    private void OnMessageReceived(object? sender, MessageReceivedEventArgs e)
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            var contact = FindContact(e.ContactId);
+            if (contact is null)
+            {
+                return;
+            }
+
+            // LastMessage fields are already updated by the wechat service on the shared instance.
+            if (SelectedContact?.Id != contact.Id && !e.Message.IsSelf)
+            {
+                contact.UnreadCount++;
+            }
+
+            BumpRecent(contact);
+        });
+    }
+
+    partial void OnSearchTextChanged(string value)
+    {
+        _searchCts?.Cancel();
+        _searchCts?.Dispose();
+        var cts = new CancellationTokenSource();
+        _searchCts = cts;
+        var version = Interlocked.Increment(ref _searchVersion);
+        _ = DebouncedSearchAsync(value, version, cts.Token);
+    }
+
+    partial void OnSelectedTabIndexChanged(int value)
+    {
+        if (!string.IsNullOrWhiteSpace(SearchText))
+        {
+            _ = RunSearchAsync(SearchText, Interlocked.Increment(ref _searchVersion), CancellationToken.None);
+        }
+        else
+        {
+            RefreshVisible();
+        }
+    }
 
     partial void OnSelectedContactChanged(Contact? value)
     {
-        if (value is not null)
+        if (value is null)
         {
-            ContactSelected?.Invoke(this, value);
+            return;
         }
+
+        ClearUnread(value);
+        ContactSelected?.Invoke(this, value);
     }
 
     [RelayCommand]
@@ -74,22 +168,60 @@ public partial class ContactListViewModel : ViewModelBase
         }
     }
 
-    private async Task SearchAsync(string keyword)
+    private async Task DebouncedSearchAsync(string keyword, int version, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(300, cancellationToken);
+            if (version != _searchVersion)
+            {
+                return;
+            }
+
+            await RunSearchAsync(keyword, version, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            // debounce superseded
+        }
+    }
+
+    private async Task RunSearchAsync(string keyword, int version, CancellationToken cancellationToken)
     {
         try
         {
             if (string.IsNullOrWhiteSpace(keyword))
             {
-                RefreshVisible();
+                if (version == _searchVersion)
+                {
+                    RefreshVisible();
+                }
+
                 return;
             }
 
-            var results = await _wechatService.SearchAsync(keyword);
-            VisibleContacts.Clear();
-            foreach (var item in results)
+            var tabFilter = SelectedTabIndex switch
             {
-                VisibleContacts.Add(item);
+                1 => (ContactType?)ContactType.Friend,
+                2 => ContactType.Group,
+                _ => null
+            };
+
+            var results = await _wechatService.SearchAsync(keyword, tabFilter, cancellationToken);
+            if (version != _searchVersion)
+            {
+                return;
             }
+
+            VisibleContacts.Clear();
+            foreach (var hit in results)
+            {
+                VisibleContacts.Add(hit.Contact);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // ignored
         }
         catch (Exception ex)
         {
