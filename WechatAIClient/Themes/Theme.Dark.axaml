@@ -1,0 +1,64 @@
+<ResourceDictionary xmlns="https://github.com/avaloniaui"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <Color x:Key="BackgroundColor">#FF0F0F1A</Color>
+  <Color x:Key="BackgroundSecondaryColor">#FF151528</Color>
+  <Color x:Key="PanelColor">#CC1A1A2E</Color>
+  <Color x:Key="PanelElevatedColor">#E61E1E36</Color>
+  <Color x:Key="GlassBorderColor">#33FFFFFF</Color>
+  <Color x:Key="TextColor">#FFF5F5FA</Color>
+  <Color x:Key="TextSecondaryColor">#FFA0A0B8</Color>
+  <Color x:Key="TextMutedColor">#FF6E6E88</Color>
+  <Color x:Key="AccentColor">#FF7C5CFF</Color>
+  <Color x:Key="AccentSecondaryColor">#FF4C8DFF</Color>
+  <Color x:Key="BubbleOtherColor">#E628283F</Color>
+  <Color x:Key="BubbleSelfStartColor">#FF4C8DFF</Color>
+  <Color x:Key="BubbleSelfEndColor">#FF7C5CFF</Color>
+  <Color x:Key="DangerColor">#FFFF5C7A</Color>
+  <Color x:Key="SuccessColor">#FF2ED573</Color>
+  <Color x:Key="HoverOverlayColor">#22FFFFFF</Color>
+  <Color x:Key="SelectedOverlayColor">#337C5CFF</Color>
+  <Color x:Key="InputBackgroundColor">#CC121222</Color>
+  <Color x:Key="ScrollbarColor">#66FFFFFF</Color>
+  <Color x:Key="TitleBarColor">#99121222</Color>
+  <Color x:Key="DividerColor">#22FFFFFF</Color>
+  <Color x:Key="QuoteBackgroundColor">#33121222</Color>
+  <Color x:Key="WindowChromeButtonHover">#33FFFFFF</Color>
+  <Color x:Key="WindowCloseHover">#FFE81123</Color>
+
+  <SolidColorBrush x:Key="BackgroundBrush" Color="{StaticResource BackgroundColor}" />
+  <SolidColorBrush x:Key="BackgroundSecondaryBrush" Color="{StaticResource BackgroundSecondaryColor}" />
+  <SolidColorBrush x:Key="PanelBrush" Color="{StaticResource PanelColor}" />
+  <SolidColorBrush x:Key="PanelElevatedBrush" Color="{StaticResource PanelElevatedColor}" />
+  <SolidColorBrush x:Key="GlassBorderBrush" Color="{StaticResource GlassBorderColor}" />
+  <SolidColorBrush x:Key="TextBrush" Color="{StaticResource TextColor}" />
+  <SolidColorBrush x:Key="TextSecondaryBrush" Color="{StaticResource TextSecondaryColor}" />
+  <SolidColorBrush x:Key="TextMutedBrush" Color="{StaticResource TextMutedColor}" />
+  <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource AccentColor}" />
+  <SolidColorBrush x:Key="AccentSecondaryBrush" Color="{StaticResource AccentSecondaryColor}" />
+  <SolidColorBrush x:Key="BubbleOtherBrush" Color="{StaticResource BubbleOtherColor}" />
+  <SolidColorBrush x:Key="DangerBrush" Color="{StaticResource DangerColor}" />
+  <SolidColorBrush x:Key="SuccessBrush" Color="{StaticResource SuccessColor}" />
+  <SolidColorBrush x:Key="HoverOverlayBrush" Color="{StaticResource HoverOverlayColor}" />
+  <SolidColorBrush x:Key="SelectedOverlayBrush" Color="{StaticResource SelectedOverlayColor}" />
+  <SolidColorBrush x:Key="InputBackgroundBrush" Color="{StaticResource InputBackgroundColor}" />
+  <SolidColorBrush x:Key="ScrollbarBrush" Color="{StaticResource ScrollbarColor}" />
+  <SolidColorBrush x:Key="TitleBarBrush" Color="{StaticResource TitleBarColor}" />
+  <SolidColorBrush x:Key="DividerBrush" Color="{StaticResource DividerColor}" />
+  <SolidColorBrush x:Key="QuoteBackgroundBrush" Color="{StaticResource QuoteBackgroundColor}" />
+  <SolidColorBrush x:Key="WindowChromeButtonHoverBrush" Color="{StaticResource WindowChromeButtonHover}" />
+  <SolidColorBrush x:Key="WindowCloseHoverBrush" Color="{StaticResource WindowCloseHover}" />
+
+  <LinearGradientBrush x:Key="AccentGradientBrush" StartPoint="0%,0%" EndPoint="100%,100%">
+    <GradientStop Offset="0" Color="{StaticResource AccentSecondaryColor}" />
+    <GradientStop Offset="1" Color="{StaticResource AccentColor}" />
+  </LinearGradientBrush>
+  <LinearGradientBrush x:Key="SelfBubbleBrush" StartPoint="0%,0%" EndPoint="100%,100%">
+    <GradientStop Offset="0" Color="{StaticResource BubbleSelfStartColor}" />
+    <GradientStop Offset="1" Color="{StaticResource BubbleSelfEndColor}" />
+  </LinearGradientBrush>
+  <LinearGradientBrush x:Key="WindowBackgroundBrush" StartPoint="0%,0%" EndPoint="100%,100%">
+    <GradientStop Offset="0" Color="#FF0B0B18" />
+    <GradientStop Offset="0.5" Color="#FF12122A" />
+    <GradientStop Offset="1" Color="#FF171730" />
+  </LinearGradientBrush>
+</ResourceDictionary>

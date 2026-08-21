@@ -1,0 +1,92 @@
+<Styles xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:controls="using:WechatAIClient.Controls">
+
+  <Style Selector="controls|Avatar">
+    <Setter Property="Template">
+      <ControlTemplate>
+        <Panel Width="{TemplateBinding Size}" Height="{TemplateBinding Size}">
+          <Ellipse Fill="{TemplateBinding AvatarBackground}" />
+          <TextBlock Text="{TemplateBinding Initials}"
+                     Foreground="White"
+                     FontWeight="SemiBold"
+                     FontSize="14"
+                     HorizontalAlignment="Center"
+                     VerticalAlignment="Center" />
+        </Panel>
+      </ControlTemplate>
+    </Setter>
+  </Style>
+
+  <Style Selector="controls|GlassCard">
+    <Setter Property="Template">
+      <ControlTemplate>
+        <Border Classes="glass-card" Padding="{TemplateBinding ContentPadding}">
+          <ContentPresenter Content="{TemplateBinding Content}" />
+        </Border>
+      </ControlTemplate>
+    </Setter>
+  </Style>
+
+  <Style Selector="controls|GlassButton">
+    <Setter Property="Background" Value="{DynamicResource PanelElevatedBrush}" />
+    <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource GlassBorderBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="10" />
+    <Setter Property="Padding" Value="12,8" />
+    <Setter Property="Cursor" Value="Hand" />
+  </Style>
+
+  <Style Selector="controls|ChatBubble">
+    <Setter Property="Template">
+      <ControlTemplate>
+        <Border Classes="message-enter"
+                MaxWidth="420"
+                Padding="12,10"
+                CornerRadius="14"
+                Background="{DynamicResource BubbleOtherBrush}">
+          <ContentPresenter Content="{TemplateBinding Content}"
+                            TextElement.Foreground="{DynamicResource TextBrush}" />
+        </Border>
+      </ControlTemplate>
+    </Setter>
+  </Style>
+
+  <Style Selector="controls|ChatBubble[IsSelf=True]">
+    <Setter Property="Template">
+      <ControlTemplate>
+        <Border Classes="message-enter"
+                MaxWidth="420"
+                Padding="12,10"
+                CornerRadius="14"
+                Background="{DynamicResource SelfBubbleBrush}">
+          <ContentPresenter Content="{TemplateBinding Content}"
+                            TextElement.Foreground="White" />
+        </Border>
+      </ControlTemplate>
+    </Setter>
+  </Style>
+
+  <Style Selector="controls|AISettingCard">
+    <Setter Property="Template">
+      <ControlTemplate>
+        <Border Background="{DynamicResource PanelElevatedBrush}"
+                BorderBrush="{DynamicResource GlassBorderBrush}"
+                BorderThickness="1"
+                CornerRadius="14"
+                Padding="14">
+          <ContentPresenter Content="{TemplateBinding Content}" />
+        </Border>
+      </ControlTemplate>
+    </Setter>
+  </Style>
+
+  <Style Selector="controls|MessageItem">
+    <Setter Property="Template">
+      <ControlTemplate>
+        <ContentPresenter Content="{TemplateBinding Content}" />
+      </ControlTemplate>
+    </Setter>
+  </Style>
+</Styles>

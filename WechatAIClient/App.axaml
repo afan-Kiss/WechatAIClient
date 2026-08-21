@@ -1,0 +1,26 @@
+<Application xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:conv="using:WechatAIClient.Converters"
+             x:Class="WechatAIClient.App"
+             RequestedThemeVariant="Dark">
+
+  <Application.Resources>
+    <ResourceDictionary>
+      <ResourceDictionary.MergedDictionaries>
+        <ResourceInclude Source="avares://WechatAIClient/Themes/Theme.Dark.axaml" />
+      </ResourceDictionary.MergedDictionaries>
+      <conv:StringToBrushConverter x:Key="StringToBrushConverter" />
+      <conv:BoolToOpacityConverter x:Key="BoolToOpacityConverter" />
+      <conv:GreaterThanZeroConverter x:Key="GreaterThanZeroConverter" />
+      <conv:MessageTypeEqualsConverter x:Key="MessageTypeEqualsConverter" />
+      <conv:TimeDisplayConverter x:Key="TimeDisplayConverter" />
+      <conv:BoolToHorizontalAlignmentConverter x:Key="BoolToHorizontalAlignmentConverter" />
+    </ResourceDictionary>
+  </Application.Resources>
+
+  <Application.Styles>
+    <FluentTheme />
+    <StyleInclude Source="avares://WechatAIClient/Styles/Controls.axaml" />
+    <StyleInclude Source="avares://WechatAIClient/Styles/ControlTemplates.axaml" />
+  </Application.Styles>
+</Application>
