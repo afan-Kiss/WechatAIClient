@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Logging;
 using WechatAIClient.Models;
+using WechatAIClient.Services.Weixin;
 
 namespace WechatAIClient.Services.Wechat;
 
@@ -218,6 +219,10 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
             : clientRequestId;
         var text = content ?? string.Empty;
         _pending.Register(clientId, contactId, text, isFromAi);
+        if (isFromAi && _bridge is LocalApiWechatBridgeClient localBridge)
+        {
+            localBridge.RegisterAiOutgoing(contactId, text, clientId);
+        }
 
         var result = await _bridge.SendTextAsync(contactId, text, clientId, cancellationToken);
         var message = BuildOutgoingMessage(contactId, text, MessageType.Text, isFromAi, clientId, result);

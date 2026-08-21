@@ -86,7 +86,8 @@ public static class WechatProcessProbe
     }
 
     /// <summary>
-    /// Classic WeChatFerry targets ~3.9.12.x. WeChat/Weixin 4.x is not hook-supported yet.
+    /// Classic WeChatFerry targets ~3.9.12.x.
+    /// Round 5: Weixin 4.x is supported via existing Hook API (19088), not process version alone.
     /// </summary>
     public static bool IsSupportedVersion(string productVersion, out string? hint)
     {
@@ -98,13 +99,19 @@ public static class WechatProcessProbe
         }
 
         var normalized = productVersion.Split('+')[0].Trim();
-        if (IsClassicFerryTarget(normalized))
+        if (IsClassicFerryTarget(normalized) || IsWeixin4HookTarget(normalized))
         {
             return true;
         }
 
-        hint = $"当前微信版本 {normalized} 暂未适配（需要后续适配器或兼容客户端）";
+        hint = $"当前微信版本 {normalized} 暂未在本客户端验证";
         return false;
+    }
+
+    public static bool IsWeixin4HookTarget(string productVersion)
+    {
+        var parts = productVersion.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return parts.Length >= 1 && parts[0] == "4";
     }
 
     public static bool IsClassicFerryTarget(string productVersion)

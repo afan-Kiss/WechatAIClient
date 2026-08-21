@@ -295,10 +295,10 @@ public partial class MainWindowViewModel : ViewModelBase
         WechatStatusText = state switch
         {
             WechatConnectionState.Connected => "● 微信已连接",
-            WechatConnectionState.WechatNotRunning => "○ 微信未运行",
-            WechatConnectionState.WaitingForLogin => "○ 等待微信登录",
-            WechatConnectionState.Connecting => "○ 正在连接微信…",
-            WechatConnectionState.VersionUnsupported => "⚠ 当前微信版本暂不兼容",
+            WechatConnectionState.WechatNotRunning => "○ Hook API 未连接",
+            WechatConnectionState.WaitingForLogin => "○ 微信未登录",
+            WechatConnectionState.Connecting => "◐ 初始化中…",
+            WechatConnectionState.VersionUnsupported => "⚠ 版本暂不兼容",
             WechatConnectionState.BridgeError => "⚠ 微信连接异常",
             _ => "○ 微信未连接"
         };

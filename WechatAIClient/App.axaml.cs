@@ -12,6 +12,7 @@ using WechatAIClient.Services.Logging;
 using WechatAIClient.Services.DeepSeek;
 using WechatAIClient.Services.Mock;
 using WechatAIClient.Services.Wechat;
+using WechatAIClient.Services.Weixin;
 using WechatAIClient.ViewModels;
 using WechatAIClient.Views;
 
@@ -117,9 +118,12 @@ public partial class App : Application
         services.AddSingleton<IClipboardService, AvaloniaClipboardService>();
         services.AddSingleton<IToastService, ToastService>();
         services.AddSingleton<IFilePickerService, AvaloniaFilePickerService>();
+        services.AddHttpClient(LocalWeixinApiClient.HttpClientName);
+        services.AddSingleton<ILocalWeixinApiClient, LocalWeixinApiClient>();
+        services.AddSingleton<IWechatCallbackParser, WechatCallbackParser>();
         services.AddSingleton<FakeWechatBridgeClient>();
         services.AddSingleton<BridgeSupervisor>();
-        services.AddSingleton<IWechatBridgeClient, ProcessWechatBridgeClient>();
+        services.AddSingleton<IWechatBridgeClient, LocalApiWechatBridgeClient>();
         services.AddSingleton<MockWechatService>();
         services.AddSingleton<RealWechatService>();
         services.AddSingleton<IWechatService, RoutingWechatService>();

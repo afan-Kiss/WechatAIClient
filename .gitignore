@@ -34,3 +34,10 @@ Desktop.ini
 *.db
 *.db-shm
 *.db-wal
+dev-samples/
+%LOCALAPPDATA%/
+Downloads/
+
+## Local secrets / runtime dumps
+**/secrets/
+**/*.har

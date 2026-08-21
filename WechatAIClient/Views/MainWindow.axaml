@@ -1014,11 +1014,18 @@
                             Classes.active="{Binding IsWechatProviderReal}"
                             Command="{Binding SetWechatProviderCommand}"
                             CommandParameter="Real"
-                            Content="Real" />
+                            Content="真实 Hook" />
                     <Button Classes="glass-button"
                             Content="重新连接"
                             Command="{Binding ReconnectWechatCommand}" />
                   </StackPanel>
+                  <TextBlock Text="本地 Hook API：127.0.0.1:19088 · 回调 5000/61108"
+                             FontSize="11"
+                             Foreground="{DynamicResource TextMutedBrush}" />
+                  <TextBlock Text="第三方 inject 需自行按命令行参数启动；App 只检测 API 在线。"
+                             FontSize="11"
+                             TextWrapping="Wrap"
+                             Foreground="{DynamicResource TextMutedBrush}" />
 
                   <Border Height="1" Background="{DynamicResource DividerBrush}" Margin="0,8" />
 

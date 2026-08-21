@@ -231,11 +231,10 @@ public class Round4WechatTests
     }
 
     [Fact]
-    public void Version_unsupported_detected_for_weixin_4()
+    public void Version_weixin_4_supported_via_hook_path()
     {
-        Assert.False(WechatProcessProbe.IsSupportedVersion("4.1.8.27", out var hint));
-        Assert.Contains("暂未适配", hint);
-        Assert.True(WechatProcessProbe.IsSupportedVersion("3.9.12.17", out _));
+        Assert.True(WechatProcessProbe.IsSupportedVersion("4.1.8.27", out _));
+        Assert.True(WechatProcessProbe.IsWeixin4HookTarget("4.1.8.27"));
     }
 
     [Fact]
