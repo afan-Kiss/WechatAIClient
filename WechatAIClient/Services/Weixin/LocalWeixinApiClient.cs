@@ -59,8 +59,12 @@ public sealed class LocalWeixinApiClient : ILocalWeixinApiClient
     {
         try
         {
-            var result = await CheckLoginAsync(cancellationToken);
-            return result.HttpStatus is >= 200 and < 500 || result.ExceptionType is null;
+            var client = _httpClientFactory.CreateClient(HttpClientName);
+            using var req = new HttpRequestMessage(HttpMethod.Post, BaseUrl + "/api/check_login");
+            req.Content = new StringContent("{}", Encoding.UTF8, "application/json");
+            using var resp = await client.SendAsync(req, cancellationToken);
+            // Got an HTTP response — reachable regardless of Success / logged-in.
+            return (int)resp.StatusCode is >= 100 and < 600;
         }
         catch
         {

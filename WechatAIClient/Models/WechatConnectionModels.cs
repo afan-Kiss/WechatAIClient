@@ -7,6 +7,7 @@ public enum WechatConnectionState
     WaitingForLogin,
     Connecting,
     Connected,
+    Degraded,
     VersionUnsupported,
     BridgeError
 }

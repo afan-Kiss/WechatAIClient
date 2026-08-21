@@ -17,8 +17,8 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
     private readonly ILogger<LocalApiWechatBridgeClient> _logger;
     private readonly MessageDeduplicator _deduper = new(800);
     private readonly PendingOutgoingTracker _pending = new();
-    private readonly PendingAiOutgoingRegistry _aiOutgoing = new();
     private readonly GroupMemberCache _memberCache = new();
+    private readonly SemaphoreSlim _refreshGate = new(1, 1);
     private readonly object _gate = new();
     private readonly List<BridgeContact> _friends = [];
     private readonly List<BridgeContact> _groups = [];
@@ -35,6 +35,7 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
     private string? _accountWxid;
     private bool _initialized;
     private bool _disposed;
+    private bool _isApiReachable;
     private WechatCallbackMode _callbackMode = WechatCallbackMode.Auto;
 
     public LocalApiWechatBridgeClient(
@@ -59,9 +60,26 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         }
     }
 
+    public bool HttpCallbackRunning => _http?.IsRunning == true;
+    public bool TcpCallbackRunning => _tcp?.IsRunning == true;
+    public bool CallbackAvailable => HttpCallbackRunning || TcpCallbackRunning;
+    public bool IsApiReachable
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _isApiReachable;
+            }
+        }
+    }
+
     public event EventHandler<WechatConnectionState>? StateChanged;
     public event EventHandler<BridgeMessageEvent>? MessageReceived;
+    public event EventHandler<OutgoingAcknowledgedEvent>? OutgoingAcknowledged;
+#pragma warning disable CS0067 // May fire on fatal bridge failures in future paths.
     public event EventHandler? BridgeCrashed;
+#pragma warning restore CS0067
 
     public void Configure(string? baseUrl, WechatCallbackMode mode)
     {
@@ -83,7 +101,7 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         _cts = new CancellationTokenSource();
         _channel = Channel.CreateBounded<WechatBridgeEvent>(new BoundedChannelOptions(2000)
         {
-            FullMode = BoundedChannelFullMode.DropOldest,
+            FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
             SingleWriter = false
         });
@@ -98,34 +116,81 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
             _loggerFactory.CreateLogger<WechatTcpCallbackServer>());
 
         await StartCallbacksAsync(_callbackMode, cancellationToken);
-        _processor = Task.Run(() => ProcessEventsAsync(_cts.Token), CancellationToken.None);
-        _healthLoop = Task.Run(() => HealthLoopAsync(_cts.Token), CancellationToken.None);
         SetState(WechatConnectionState.Connecting);
         await RefreshConnectionAsync(cancellationToken);
+
+        // Health + processor only after first refresh (no race with init).
+        _processor = Task.Run(() => ProcessEventsAsync(_cts.Token), CancellationToken.None);
+        _healthLoop = Task.Run(() => HealthLoopAsync(_cts.Token), CancellationToken.None);
     }
 
     public async Task StopAsync(CancellationToken cancellationToken = default)
     {
+        var cts = _cts;
+        var processor = _processor;
+        var health = _healthLoop;
+        var http = _http;
+        var tcp = _tcp;
+        var channel = _channel;
+
         try
         {
-            _cts?.Cancel();
+            cts?.Cancel();
         }
         catch
         {
             // ignore
         }
 
-        if (_http is not null)
+        if (http is not null)
         {
-            await _http.StopAsync();
+            try
+            {
+                await http.StopAsync();
+            }
+            catch
+            {
+                // ignore
+            }
         }
 
-        if (_tcp is not null)
+        if (tcp is not null)
         {
-            await _tcp.StopAsync();
+            try
+            {
+                await tcp.StopAsync();
+            }
+            catch
+            {
+                // ignore
+            }
         }
 
-        _channel?.Writer.TryComplete();
+        channel?.Writer.TryComplete();
+
+        await WaitTaskAsync(processor, TimeSpan.FromSeconds(3));
+        await WaitTaskAsync(health, TimeSpan.FromSeconds(3));
+
+        if (cts is not null)
+        {
+            try
+            {
+                cts.Dispose();
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+
+        // Reset so StartAsync can run again.
+        _cts = null;
+        _processor = null;
+        _healthLoop = null;
+        _channel = null;
+        _http = null;
+        _tcp = null;
+        _initialized = false;
         SetState(WechatConnectionState.Disconnected);
     }
 
@@ -141,7 +206,8 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
-            return Task.FromResult(_state == WechatConnectionState.Connected ? _account : null);
+            var ok = _state is WechatConnectionState.Connected or WechatConnectionState.Degraded;
+            return Task.FromResult(ok ? _account : null);
         }
     }
 
@@ -168,15 +234,11 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
+            // Only contacts with real activity — never fake first 50.
             var recent = _friends.Concat(_groups)
                 .Where(c => c.LastMessageTime is not null)
                 .OrderByDescending(c => c.LastMessageTime)
                 .ToList();
-            if (recent.Count == 0)
-            {
-                recent = _friends.Concat(_groups).Take(50).ToList();
-            }
-
             return Task.FromResult<IReadOnlyList<BridgeContact>>(recent);
         }
     }
@@ -203,14 +265,15 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         string conversationId,
         string text,
         string clientRequestId,
+        bool isFromAi = false,
         CancellationToken cancellationToken = default)
     {
-        if (State != WechatConnectionState.Connected)
+        if (!IsSendReady())
         {
             return Fail(clientRequestId, "NotConnected", "微信 Hook 未连接");
         }
 
-        _pending.Register(clientRequestId, conversationId, text, isFromAi: false);
+        _pending.Register(clientRequestId, conversationId, text, isFromAi);
         var result = await _api.SendTextAsync(conversationId, text, cancellationToken);
         if (!result.Success)
         {
@@ -225,9 +288,10 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         string conversationId,
         string localPath,
         string clientRequestId,
+        bool isFromAi = false,
         CancellationToken cancellationToken = default)
     {
-        if (State != WechatConnectionState.Connected)
+        if (!IsSendReady())
         {
             return Fail(clientRequestId, "NotConnected", "微信 Hook 未连接");
         }
@@ -237,7 +301,7 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
             return Fail(clientRequestId, "FileNotFound", "图片文件不存在");
         }
 
-        _pending.Register(clientRequestId, conversationId, "[图片]", isFromAi: false);
+        _pending.Register(clientRequestId, conversationId, "[图片]", isFromAi);
         var result = await _api.SendImageAsync(conversationId, localPath, cancellationToken);
         if (!result.Success)
         {
@@ -252,9 +316,10 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         string conversationId,
         string localPath,
         string clientRequestId,
+        bool isFromAi = false,
         CancellationToken cancellationToken = default)
     {
-        if (State != WechatConnectionState.Connected)
+        if (!IsSendReady())
         {
             return Fail(clientRequestId, "NotConnected", "微信 Hook 未连接");
         }
@@ -264,7 +329,7 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
             return Fail(clientRequestId, "FileNotFound", "文件不存在");
         }
 
-        _pending.Register(clientRequestId, conversationId, "[文件]", isFromAi: false);
+        _pending.Register(clientRequestId, conversationId, "[文件]", isFromAi);
         var result = await _api.SendFileAsync(conversationId, localPath, cancellationToken);
         if (!result.Success)
         {
@@ -285,9 +350,6 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
             "Weixin Hook API @ 19088"));
     }
 
-    public void RegisterAiOutgoing(string conversationId, string content, string generationId)
-        => _aiOutgoing.Register(conversationId, content, generationId);
-
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
@@ -297,21 +359,17 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
 
         _disposed = true;
         await StopAsync();
-        if (_http is not null)
-        {
-            await _http.DisposeAsync();
-        }
-
-        if (_tcp is not null)
-        {
-            await _tcp.DisposeAsync();
-        }
+        _refreshGate.Dispose();
     }
+
+    private bool IsSendReady()
+        => State is WechatConnectionState.Connected or WechatConnectionState.Degraded;
 
     private async Task StartCallbacksAsync(WechatCallbackMode mode, CancellationToken ct)
     {
         var startHttp = mode is WechatCallbackMode.Auto or WechatCallbackMode.Http or WechatCallbackMode.Both;
         var startTcp = mode is WechatCallbackMode.Auto or WechatCallbackMode.Tcp or WechatCallbackMode.Both;
+
         if (startHttp && _http is not null)
         {
             try
@@ -343,6 +401,12 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
                 }
             }
         }
+
+        if ((mode is WechatCallbackMode.Auto or WechatCallbackMode.Both) &&
+            !CallbackAvailable)
+        {
+            _logger.LogWarning("No callback transport available (HTTP/TCP both failed)");
+        }
     }
 
     private async Task HealthLoopAsync(CancellationToken token)
@@ -351,31 +415,59 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         {
             try
             {
-                await RefreshConnectionAsync(token);
-            }
-            catch (Exception ex) when (!token.IsCancellationRequested)
-            {
-                _logger.LogDebug(ex, "health loop tick failed");
-            }
-
-            try
-            {
                 await Task.Delay(TimeSpan.FromSeconds(3), token);
             }
             catch (OperationCanceledException)
             {
                 break;
             }
+
+            try
+            {
+                await RefreshConnectionAsync(token);
+            }
+            catch (Exception ex) when (!token.IsCancellationRequested)
+            {
+                _logger.LogDebug(ex, "health loop tick failed");
+            }
         }
     }
 
     private async Task RefreshConnectionAsync(CancellationToken token)
     {
+        await _refreshGate.WaitAsync(token);
+        try
+        {
+            await RefreshConnectionCoreAsync(token);
+        }
+        finally
+        {
+            _refreshGate.Release();
+        }
+    }
+
+    private async Task RefreshConnectionCoreAsync(CancellationToken token)
+    {
+        var reachable = false;
+        try
+        {
+            reachable = await _api.IsApiReachableAsync(token);
+        }
+        catch
+        {
+            reachable = false;
+        }
+
+        lock (_gate)
+        {
+            _isApiReachable = reachable;
+        }
+
         var login = await _api.CheckLoginAsync(token);
         if (login.ExceptionType == "HookApiOffline" ||
             string.Equals(login.ExceptionType, "HookApiOffline", StringComparison.Ordinal))
         {
-            SetState(WechatConnectionState.WechatNotRunning); // HookApiOffline mapped for UI
+            SetState(WechatConnectionState.WechatNotRunning);
             return;
         }
 
@@ -393,8 +485,17 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
                    ?? login.Data?.Data?.NickName
                    ?? login.Data?.Data?.NickNameAlt
                    ?? "微信用户";
+
         if (!string.IsNullOrWhiteSpace(wxid))
         {
+            if (!string.IsNullOrWhiteSpace(_accountWxid) &&
+                !string.Equals(_accountWxid, wxid, StringComparison.Ordinal))
+            {
+                _logger.LogWarning("Account wxid changed {Old} → {New}; clearing caches", _accountWxid, wxid);
+                ClearAccountCaches();
+                _initialized = false;
+            }
+
             _accountWxid = wxid;
             _account = new WechatAccountInfo(wxid, nick, null);
         }
@@ -402,68 +503,146 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         if (!_initialized)
         {
             SetState(WechatConnectionState.Connecting);
-            await _api.WechatInitAsync(token);
-            await _api.InitRoomsAsync(token);
-            await LoadContactsAsync(token);
+
+            var init = await _api.WechatInitAsync(token);
+            if (!init.Success)
+            {
+                _logger.LogWarning("wechat_init failed: {Error}", init.ErrorMessage);
+                SetState(WechatConnectionState.BridgeError);
+                return;
+            }
+
+            var rooms = await _api.InitRoomsAsync(token);
+            if (!rooms.Success)
+            {
+                _logger.LogWarning("init_rooms failed: {Error}", rooms.ErrorMessage);
+                SetState(WechatConnectionState.BridgeError);
+                return;
+            }
+
+            var load = await LoadContactsAsync(token);
+            if (load == ContactLoadResult.BothFailed)
+            {
+                _logger.LogWarning("Both contact and group list failed");
+                SetState(WechatConnectionState.BridgeError);
+                return;
+            }
+
             _initialized = true;
+
+            if (!CallbackAvailable || load == ContactLoadResult.Partial)
+            {
+                SetState(WechatConnectionState.Degraded);
+                return;
+            }
+
+            SetState(WechatConnectionState.Connected);
+            return;
+        }
+
+        // Already initialized — refresh capability state.
+        if (!CallbackAvailable)
+        {
+            SetState(WechatConnectionState.Degraded);
+            return;
         }
 
         SetState(WechatConnectionState.Connected);
     }
 
-    private async Task LoadContactsAsync(CancellationToken token)
+    private enum ContactLoadResult
+    {
+        Ok,
+        Partial,
+        BothFailed
+    }
+
+    private async Task<ContactLoadResult> LoadContactsAsync(CancellationToken token)
     {
         var friends = await _api.GetContactList2Async(token);
         var rooms = await _api.GetChatroomListAsync(token);
+        var friendsOk = friends.Success;
+        var roomsOk = rooms.Success;
+
         lock (_gate)
         {
-            _friends.Clear();
-            _groups.Clear();
-            if (friends.Data?.FriendList is { } list)
+            if (friendsOk)
             {
-                foreach (var f in list)
+                _friends.Clear();
+                if (friends.Data?.FriendList is { } list)
                 {
-                    if (string.IsNullOrWhiteSpace(f.Wxid))
+                    foreach (var f in list)
                     {
-                        continue;
-                    }
+                        if (string.IsNullOrWhiteSpace(f.Wxid))
+                        {
+                            continue;
+                        }
 
-                    var name = FirstNonEmpty(f.Remark, f.NickName, f.Alias, f.Wxid)!;
-                    _friends.Add(new BridgeContact(
-                        f.Wxid,
-                        name,
-                        false,
-                        f.SmallHeadUrl ?? f.BigHeadUrl,
-                        null,
-                        null));
+                        var name = FirstNonEmpty(f.Remark, f.NickName, f.Alias, f.Wxid)!;
+                        _friends.Add(new BridgeContact(
+                            f.Wxid,
+                            name,
+                            false,
+                            f.SmallHeadUrl ?? f.BigHeadUrl,
+                            null,
+                            null));
+                    }
                 }
             }
 
-            if (rooms.Data?.Data is { } groups)
+            if (roomsOk)
             {
-                foreach (var g in groups)
+                _groups.Clear();
+                if (rooms.Data?.Data is { } groups)
                 {
-                    if (string.IsNullOrWhiteSpace(g.Username))
+                    foreach (var g in groups)
                     {
-                        continue;
-                    }
+                        if (string.IsNullOrWhiteSpace(g.Username))
+                        {
+                            continue;
+                        }
 
-                    var name = FirstNonEmpty(g.Remark, g.NickName, g.Username)!;
-                    _groups.Add(new BridgeContact(
-                        g.Username,
-                        name,
-                        true,
-                        g.SmallHeadUrl ?? g.BigHeadUrl,
-                        null,
-                        null));
+                        var name = FirstNonEmpty(g.Remark, g.NickName, g.Username)!;
+                        _groups.Add(new BridgeContact(
+                            g.Username,
+                            name,
+                            true,
+                            g.SmallHeadUrl ?? g.BigHeadUrl,
+                            null,
+                            null));
+                    }
                 }
             }
         }
 
         _logger.LogInformation(
-            "Loaded contacts friends={Friends} groups={Groups}",
-            _friends.Count,
-            _groups.Count);
+            "Loaded contacts friendsOk={FriendsOk} count={Friends} groupsOk={GroupsOk} count={Groups}",
+            friendsOk, _friends.Count, roomsOk, _groups.Count);
+
+        if (!friendsOk && !roomsOk)
+        {
+            return ContactLoadResult.BothFailed;
+        }
+
+        if (!friendsOk || !roomsOk)
+        {
+            return ContactLoadResult.Partial;
+        }
+
+        return ContactLoadResult.Ok;
+    }
+
+    private void ClearAccountCaches()
+    {
+        lock (_gate)
+        {
+            _friends.Clear();
+            _groups.Clear();
+            _messages.Clear();
+        }
+
+        _deduper.Clear();
+        _memberCache.Clear();
     }
 
     private async Task ProcessEventsAsync(CancellationToken token)
@@ -473,16 +652,23 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
             return;
         }
 
-        await foreach (var ev in _channel.Reader.ReadAllAsync(token))
+        try
         {
-            try
+            await foreach (var ev in _channel.Reader.ReadAllAsync(token))
             {
-                HandleEvent(ev);
+                try
+                {
+                    HandleEvent(ev);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "bridge event processing failed");
+                }
             }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "bridge event processing failed");
-            }
+        }
+        catch (OperationCanceledException)
+        {
+            // expected on stop
         }
     }
 
@@ -494,10 +680,11 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         }
 
         var msg = ev.Message;
-        // Mark IsFromMe via account wxid when possible
+        NormalizeConversation(msg);
+
         if (!msg.IsFromMe &&
             !string.IsNullOrWhiteSpace(_accountWxid) &&
-            string.Equals(msg.SenderId, _accountWxid, StringComparison.Ordinal))
+            string.Equals(msg.FromWxid ?? msg.SenderId, _accountWxid, StringComparison.Ordinal))
         {
             msg.IsFromMe = true;
             if (ev.Kind is WechatBridgeEventKind.IncomingPrivateMessage or WechatBridgeEventKind.IncomingGroupMessage)
@@ -514,20 +701,24 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         if (msg.IsFromMe || ev.Kind is WechatBridgeEventKind.SelfTextMessage
                 or WechatBridgeEventKind.SelfImageMessage or WechatBridgeEventKind.SelfFileMessage)
         {
-            if (_aiOutgoing.TryMatch(msg.ConversationId, msg.Content, out _))
+            var normalizedContent = PendingOutgoingTracker.NormalizeContent(msg.Content);
+            if (_pending.TryMatchEcho(msg.ConversationId, normalizedContent, out var matchSource, out var clientRequestId) &&
+                !string.IsNullOrWhiteSpace(clientRequestId))
             {
-                // AI echo — reconcile only, do not raise as remote
-                StoreLocal(ToBridgeMessage(msg, isFromMe: true));
+                var ack = ToBridgeMessage(msg, isFromMe: true);
+                StoreLocal(ack);
+                OutgoingAcknowledged?.Invoke(this, new OutgoingAcknowledgedEvent
+                {
+                    ClientRequestId = clientRequestId,
+                    RealMessageId = msg.MessageId,
+                    ConversationId = msg.ConversationId,
+                    IsFromAi = matchSource == OutgoingMatchSource.AiGenerated,
+                    Message = ack
+                });
                 return;
             }
 
-            if (_pending.TryMatchEcho(msg.ConversationId, msg.Content, out _, out _))
-            {
-                StoreLocal(ToBridgeMessage(msg, isFromMe: true));
-                return;
-            }
-
-            // Manual self message from phone/other client
+            // Unmatched self (phone / other client) — raise as MessageReceived with IsFromMe.
             var self = ToBridgeMessage(msg, isFromMe: true);
             StoreLocal(self);
             MessageReceived?.Invoke(this, new BridgeMessageEvent { Message = self });
@@ -538,6 +729,12 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
         StoreLocal(bridge);
         MessageReceived?.Invoke(this, new BridgeMessageEvent { Message = bridge });
     }
+
+    /// <summary>
+    /// group → room; private incoming (from != account) → from; private outgoing (from == account) → to.
+    /// </summary>
+    private void NormalizeConversation(WechatIncomingMessage msg)
+        => WechatConversationNormalizer.Apply(msg, _accountWxid);
 
     private void StoreLocal(BridgeMessage message)
     {
@@ -605,7 +802,7 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
             msg.Content,
             isFromMe,
             msg.IsGroup,
-            msg.SenderId,
+            msg.SenderId ?? msg.FromWxid,
             msg.SenderDisplayName,
             msg.Timestamp,
             msg.MessageType switch
@@ -633,10 +830,35 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
                 return;
             }
 
+            // Leaving Connected/Degraded → offline/waiting: require re-init next time.
+            if (previous is WechatConnectionState.Connected or WechatConnectionState.Degraded &&
+                state is not WechatConnectionState.Connected and not WechatConnectionState.Degraded
+                    and not WechatConnectionState.Connecting)
+            {
+                _initialized = false;
+            }
+
             _state = state;
         }
 
         StateChanged?.Invoke(this, state);
+    }
+
+    private static async Task WaitTaskAsync(Task? task, TimeSpan timeout)
+    {
+        if (task is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await task.WaitAsync(timeout);
+        }
+        catch
+        {
+            // timeout / cancel — ignore
+        }
     }
 
     private static SendMessageResult Fail(string clientRequestId, string code, string message)
@@ -644,56 +866,6 @@ public sealed class LocalApiWechatBridgeClient : IWechatBridgeClient
 
     private static string? FirstNonEmpty(params string?[] values)
         => values.FirstOrDefault(v => !string.IsNullOrWhiteSpace(v));
-}
-
-public sealed class PendingAiOutgoingRegistry
-{
-    private readonly List<(string ConversationId, string Content, string GenerationId, DateTime At)> _items = [];
-    private readonly object _gate = new();
-    private readonly TimeSpan _ttl = TimeSpan.FromMinutes(3);
-
-    public void Register(string conversationId, string content, string generationId)
-    {
-        lock (_gate)
-        {
-            Prune();
-            _items.Add((conversationId, content ?? "", generationId, DateTime.UtcNow));
-        }
-    }
-
-    public bool TryMatch(string conversationId, string content, out string? generationId)
-    {
-        generationId = null;
-        lock (_gate)
-        {
-            Prune();
-            for (var i = 0; i < _items.Count; i++)
-            {
-                var item = _items[i];
-                if (!string.Equals(item.ConversationId, conversationId, StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                if (!string.Equals(item.Content, content, StringComparison.Ordinal))
-                {
-                    continue;
-                }
-
-                generationId = item.GenerationId;
-                _items.RemoveAt(i);
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private void Prune()
-    {
-        var now = DateTime.UtcNow;
-        _items.RemoveAll(i => now - i.At > _ttl);
-    }
 }
 
 public sealed class GroupMemberCache
@@ -723,6 +895,14 @@ public sealed class GroupMemberCache
         lock (_gate)
         {
             _cache[key] = (nick, DateTime.UtcNow);
+        }
+    }
+
+    public void Clear()
+    {
+        lock (_gate)
+        {
+            _cache.Clear();
         }
     }
 }

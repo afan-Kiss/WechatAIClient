@@ -54,6 +54,7 @@ public sealed class ProcessWechatBridgeClient : IWechatBridgeClient
     public event EventHandler<WechatConnectionState>? StateChanged;
 #pragma warning disable CS0067 // Event required by interface; messaging adapter not wired for Process probe yet.
     public event EventHandler<BridgeMessageEvent>? MessageReceived;
+    public event EventHandler<OutgoingAcknowledgedEvent>? OutgoingAcknowledged;
 #pragma warning restore CS0067
     public event EventHandler? BridgeCrashed;
 
@@ -173,9 +174,11 @@ public sealed class ProcessWechatBridgeClient : IWechatBridgeClient
         string conversationId,
         string text,
         string clientRequestId,
+        bool isFromAi = false,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        _ = isFromAi;
         if (State != WechatConnectionState.Connected)
         {
             return Task.FromResult(new SendMessageResult(
@@ -192,9 +195,11 @@ public sealed class ProcessWechatBridgeClient : IWechatBridgeClient
         string conversationId,
         string localPath,
         string clientRequestId,
+        bool isFromAi = false,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        _ = isFromAi;
         return Task.FromResult(new SendMessageResult(
             false, null, clientRequestId, DateTime.Now, "NotSupported", "图片发送暂未实现"));
     }
@@ -203,9 +208,11 @@ public sealed class ProcessWechatBridgeClient : IWechatBridgeClient
         string conversationId,
         string localPath,
         string clientRequestId,
+        bool isFromAi = false,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        _ = isFromAi;
         return Task.FromResult(new SendMessageResult(
             false, null, clientRequestId, DateTime.Now, "NotSupported", "文件发送暂未实现"));
     }

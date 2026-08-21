@@ -220,13 +220,14 @@ public class Round5WeixinHookTests
     }
 
     [Fact]
-    public void Ai_outgoing_registry_matches_and_consumes()
+    public void Pending_outgoing_tracker_matches_normalized_content()
     {
-        var reg = new PendingAiOutgoingRegistry();
-        reg.Register("c1", "AI回复", "gen1");
-        Assert.True(reg.TryMatch("c1", "AI回复", out var gid));
-        Assert.Equal("gen1", gid);
-        Assert.False(reg.TryMatch("c1", "AI回复", out _));
+        var tracker = new WechatAIClient.Services.Wechat.PendingOutgoingTracker();
+        tracker.Register("req1", "c1", "AI回复\r\n", isFromAi: true);
+        Assert.True(tracker.TryMatchEcho("c1", "AI回复\n", out var source, out var id));
+        Assert.Equal(WechatAIClient.Services.Wechat.OutgoingMatchSource.AiGenerated, source);
+        Assert.Equal("req1", id);
+        Assert.False(tracker.TryMatchEcho("c1", "AI回复", out _, out _));
     }
 
     [Fact]

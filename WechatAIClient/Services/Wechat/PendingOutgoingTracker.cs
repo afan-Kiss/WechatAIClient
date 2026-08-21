@@ -43,7 +43,7 @@ public sealed class PendingOutgoingTracker
             _pending.Add(new PendingOutgoingEntry(
                 clientRequestId,
                 conversationId,
-                content ?? string.Empty,
+                NormalizeContent(content),
                 isFromAi,
                 timestamp ?? DateTime.UtcNow));
         }
@@ -57,6 +57,7 @@ public sealed class PendingOutgoingTracker
     {
         source = OutgoingMatchSource.UserManual;
         clientRequestId = null;
+        var normalized = NormalizeContent(content);
         lock (_gate)
         {
             PruneLocked(DateTime.UtcNow);
@@ -68,7 +69,7 @@ public sealed class PendingOutgoingTracker
                     continue;
                 }
 
-                if (!string.Equals(item.Content, content, StringComparison.Ordinal))
+                if (!string.Equals(item.Content, normalized, StringComparison.Ordinal))
                 {
                     continue;
                 }
@@ -118,6 +119,18 @@ public sealed class PendingOutgoingTracker
                 return _pending.Count;
             }
         }
+    }
+
+    public static string NormalizeContent(string? content)
+    {
+        if (string.IsNullOrEmpty(content))
+        {
+            return string.Empty;
+        }
+
+        return content.Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace("\r", "\n", StringComparison.Ordinal)
+            .TrimEnd();
     }
 
     private void PruneLocked(DateTime utcNow)

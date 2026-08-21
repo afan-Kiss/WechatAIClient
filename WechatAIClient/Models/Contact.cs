@@ -28,6 +28,9 @@ public partial class Contact : ObservableObject
     private DateTime _lastMessageTime = DateTime.Now;
 
     [ObservableProperty]
+    private bool _hasLastActivity;
+
+    [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(UnreadDisplay))]
     private int _unreadCount;
 

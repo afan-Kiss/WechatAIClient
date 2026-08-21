@@ -14,6 +14,11 @@ public sealed class TimeDisplayConverter : IValueConverter
             return string.Empty;
         }
 
+        if (dt == default || dt == DateTime.MinValue)
+        {
+            return string.Empty;
+        }
+
         if (dt.Date == DateTime.Today)
         {
             return dt.ToString("HH:mm");

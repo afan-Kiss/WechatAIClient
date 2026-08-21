@@ -11,6 +11,7 @@ public sealed class FakeWechatBridgeClient : IWechatBridgeClient
     private readonly Dictionary<string, List<BridgeMessage>> _messages = new(StringComparer.Ordinal);
     private readonly List<BridgeContact> _contacts = [];
     private readonly List<BridgeContact> _groups = [];
+    private readonly PendingOutgoingTracker _pending = new();
     private WechatConnectionState _state = WechatConnectionState.Disconnected;
     private WechatAccountInfo? _account;
     private WechatVersionInfo _version = new("0.0.0.0", string.Empty, false, "未检测");
@@ -32,6 +33,7 @@ public sealed class FakeWechatBridgeClient : IWechatBridgeClient
 
     public event EventHandler<WechatConnectionState>? StateChanged;
     public event EventHandler<BridgeMessageEvent>? MessageReceived;
+    public event EventHandler<OutgoingAcknowledgedEvent>? OutgoingAcknowledged;
     public event EventHandler? BridgeCrashed;
 
     public bool ForceSendFail
@@ -119,10 +121,31 @@ public sealed class FakeWechatBridgeClient : IWechatBridgeClient
             }
         }
 
-        if (raiseEvent)
+        if (!raiseEvent)
         {
-            MessageReceived?.Invoke(this, new BridgeMessageEvent { Message = message });
+            return;
         }
+
+        if (message.IsFromMe &&
+            _pending.TryMatchEcho(
+                message.ConversationId,
+                message.Content,
+                out var matchSource,
+                out var clientRequestId) &&
+            !string.IsNullOrWhiteSpace(clientRequestId))
+        {
+            OutgoingAcknowledged?.Invoke(this, new OutgoingAcknowledgedEvent
+            {
+                ClientRequestId = clientRequestId,
+                RealMessageId = message.Id,
+                ConversationId = message.ConversationId,
+                IsFromAi = matchSource == OutgoingMatchSource.AiGenerated,
+                Message = message
+            });
+            return;
+        }
+
+        MessageReceived?.Invoke(this, new BridgeMessageEvent { Message = message });
     }
 
     public void TriggerCrash()
@@ -249,7 +272,8 @@ public sealed class FakeWechatBridgeClient : IWechatBridgeClient
             }
 
             var all = _contacts.Concat(_groups)
-                .OrderByDescending(c => c.LastMessageTime ?? DateTime.MinValue)
+                .Where(c => c.LastMessageTime is not null)
+                .OrderByDescending(c => c.LastMessageTime)
                 .ToList();
             return Task.FromResult<IReadOnlyList<BridgeContact>>(all);
         }
@@ -292,6 +316,7 @@ public sealed class FakeWechatBridgeClient : IWechatBridgeClient
         string conversationId,
         string text,
         string clientRequestId,
+        bool isFromAi = false,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -310,6 +335,7 @@ public sealed class FakeWechatBridgeClient : IWechatBridgeClient
                     false, null, clientRequestId, now, "SendFailed", "模拟发送失败"));
             }
 
+            _pending.Register(clientRequestId, conversationId, text, isFromAi);
             var id = Guid.NewGuid().ToString("N");
             var msg = new BridgeMessage(
                 id,
@@ -336,9 +362,11 @@ public sealed class FakeWechatBridgeClient : IWechatBridgeClient
         string conversationId,
         string localPath,
         string clientRequestId,
+        bool isFromAi = false,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        _ = isFromAi;
         return Task.FromResult(new SendMessageResult(
             false, null, clientRequestId, DateTime.Now, "NotSupported", "图片发送暂未实现"));
     }
@@ -347,9 +375,11 @@ public sealed class FakeWechatBridgeClient : IWechatBridgeClient
         string conversationId,
         string localPath,
         string clientRequestId,
+        bool isFromAi = false,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        _ = isFromAi;
         return Task.FromResult(new SendMessageResult(
             false, null, clientRequestId, DateTime.Now, "NotSupported", "文件发送暂未实现"));
     }

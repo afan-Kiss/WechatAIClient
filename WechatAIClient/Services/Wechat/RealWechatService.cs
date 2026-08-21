@@ -1,6 +1,5 @@
 using Microsoft.Extensions.Logging;
 using WechatAIClient.Models;
-using WechatAIClient.Services.Weixin;
 
 namespace WechatAIClient.Services.Wechat;
 
@@ -22,6 +21,7 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
         _logger = logger;
         _bridge.StateChanged += OnBridgeStateChanged;
         _bridge.MessageReceived += OnBridgeMessage;
+        _bridge.OutgoingAcknowledged += OnOutgoingAcknowledged;
     }
 
     public event EventHandler<MessageReceivedEventArgs>? MessageReceived;
@@ -31,12 +31,14 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
 
     public async Task EnsureStartedAsync(CancellationToken cancellationToken = default)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        // Always call StartAsync so Stop/Start of the bridge can recover.
+        await _bridge.StartAsync(cancellationToken);
         if (_started)
         {
             return;
         }
 
-        await _bridge.StartAsync(cancellationToken);
         _started = true;
         await RefreshContactsCacheAsync(cancellationToken);
     }
@@ -122,16 +124,32 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         await EnsureStartedAsync(cancellationToken);
-        var recent = await GetRecentChatsAsync(cancellationToken);
-        IEnumerable<Contact> contacts = recent;
-        if (tabFilter is ContactType filter)
+
+        var contacts = new List<Contact>();
+        if (tabFilter is null or ContactType.Friend)
         {
-            contacts = contacts.Where(c => c.Type == filter);
+            contacts.AddRange(await GetContactsAsync(cancellationToken));
         }
+
+        if (tabFilter is null or ContactType.Group)
+        {
+            contacts.AddRange(await GetGroupsAsync(cancellationToken));
+        }
+
+        // Dedupe by id (Friend+Group union when tabFilter is null).
+        var byId = new Dictionary<string, Contact>(StringComparer.Ordinal);
+        foreach (var c in contacts)
+        {
+            byId[c.Id] = c;
+        }
+
+        contacts = byId.Values.ToList();
 
         if (string.IsNullOrWhiteSpace(keyword))
         {
             return contacts
+                .OrderByDescending(c => c.HasLastActivity)
+                .ThenByDescending(c => c.LastMessageTime)
                 .Select(c => new SearchHit
                 {
                     Contact = c,
@@ -141,18 +159,72 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
                 .ToList();
         }
 
-        return contacts
-            .Where(c => c.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
-                        c.LastMessage.Contains(keyword, StringComparison.OrdinalIgnoreCase))
-            .Select(c => new SearchHit
+        var hits = new List<SearchHit>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var contact in contacts)
+        {
+            if (contact.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase))
             {
-                Contact = c,
-                MatchSummary = c.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase)
-                    ? c.Name
-                    : c.LastMessage,
-                HitKind = c.Type == ContactType.Group ? SearchHitKind.Group : SearchHitKind.Contact
-            })
-            .ToList();
+                hits.Add(new SearchHit
+                {
+                    Contact = contact,
+                    MatchSummary = contact.Name,
+                    HitKind = contact.Type == ContactType.Group ? SearchHitKind.Group : SearchHitKind.Contact
+                });
+                seen.Add(contact.Id);
+            }
+        }
+
+        lock (_gate)
+        {
+            foreach (var contact in contacts)
+            {
+                if (!_messages.TryGetValue(contact.Id, out var messages))
+                {
+                    continue;
+                }
+
+                var match = messages.LastOrDefault(m =>
+                    m.Content.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+                if (match is null)
+                {
+                    continue;
+                }
+
+                if (!seen.Add(contact.Id))
+                {
+                    continue;
+                }
+
+                hits.Add(new SearchHit
+                {
+                    Contact = contact,
+                    MatchSummary = match.Content,
+                    HitKind = SearchHitKind.Message
+                });
+            }
+        }
+
+        foreach (var contact in contacts)
+        {
+            if (seen.Contains(contact.Id))
+            {
+                continue;
+            }
+
+            if (contact.LastMessage.Contains(keyword, StringComparison.OrdinalIgnoreCase))
+            {
+                hits.Add(new SearchHit
+                {
+                    Contact = contact,
+                    MatchSummary = contact.LastMessage,
+                    HitKind = SearchHitKind.Message
+                });
+            }
+        }
+
+        return hits;
     }
 
     public async Task<ChatMessage> SendMessageAsync(
@@ -170,7 +242,7 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
         {
             var clientId = Guid.NewGuid().ToString("N");
             _pending.Register(clientId, contactId, "[图片]", isFromAi);
-            var result = await _bridge.SendImageAsync(contactId, imagePath, clientId, cancellationToken);
+            var result = await _bridge.SendImageAsync(contactId, imagePath, clientId, isFromAi, cancellationToken);
             return BuildOutgoingMessage(contactId, "[图片]", MessageType.Image, isFromAi, clientId, result, imagePath, fileName);
         }
 
@@ -179,7 +251,7 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
             var path = imagePath ?? fileName ?? string.Empty;
             var clientId = Guid.NewGuid().ToString("N");
             _pending.Register(clientId, contactId, "[文件]", isFromAi);
-            var result = await _bridge.SendFileAsync(contactId, path, clientId, cancellationToken);
+            var result = await _bridge.SendFileAsync(contactId, path, clientId, isFromAi, cancellationToken);
             return BuildOutgoingMessage(contactId, "[文件]", MessageType.File, isFromAi, clientId, result, path, fileName, fileSize);
         }
 
@@ -218,13 +290,9 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
             ? Guid.NewGuid().ToString("N")
             : clientRequestId;
         var text = content ?? string.Empty;
+        // Local pending only for UI-row lookup on Ack; bridge owns echo match.
         _pending.Register(clientId, contactId, text, isFromAi);
-        if (isFromAi && _bridge is LocalApiWechatBridgeClient localBridge)
-        {
-            localBridge.RegisterAiOutgoing(contactId, text, clientId);
-        }
-
-        var result = await _bridge.SendTextAsync(contactId, text, clientId, cancellationToken);
+        var result = await _bridge.SendTextAsync(contactId, text, clientId, isFromAi, cancellationToken);
         var message = BuildOutgoingMessage(contactId, text, MessageType.Text, isFromAi, clientId, result);
         lock (_gate)
         {
@@ -280,11 +348,13 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
         _disposed = true;
         _bridge.StateChanged -= OnBridgeStateChanged;
         _bridge.MessageReceived -= OnBridgeMessage;
+        _bridge.OutgoingAcknowledged -= OnOutgoingAcknowledged;
         await _bridge.DisposeAsync();
     }
 
     private async Task RefreshContactsCacheAsync(CancellationToken cancellationToken)
     {
+        var stateBefore = _bridge.State;
         try
         {
             var recent = await _bridge.GetRecentAsync(cancellationToken);
@@ -300,12 +370,59 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to refresh contacts cache");
+            // Leave connection state to the bridge — never paint green on refresh failure.
+            if (stateBefore == WechatConnectionState.Connected ||
+                _bridge.State == WechatConnectionState.Connected)
+            {
+                _logger.LogWarning(ex, "Failed to refresh contacts cache while connected");
+            }
+            else if (_bridge.State == WechatConnectionState.WechatNotRunning)
+            {
+                _logger.LogDebug(ex, "Contacts refresh skipped; Hook API offline");
+            }
+            else
+            {
+                _logger.LogWarning(ex, "Failed to refresh contacts cache (state={State})", _bridge.State);
+            }
         }
     }
 
     private void OnBridgeStateChanged(object? sender, WechatConnectionState state)
         => ConnectionStateChanged?.Invoke(this, state);
+
+    private void OnOutgoingAcknowledged(object? sender, OutgoingAcknowledgedEvent e)
+    {
+        try
+        {
+            _pending.TryConsumeByClientRequestId(e.ClientRequestId, out _);
+            lock (_gate)
+            {
+                if (!_messages.TryGetValue(e.ConversationId, out var list))
+                {
+                    return;
+                }
+
+                var pending = list.FirstOrDefault(m =>
+                    string.Equals(m.ClientRequestId, e.ClientRequestId, StringComparison.Ordinal));
+                if (pending is null)
+                {
+                    return;
+                }
+
+                pending.Id = e.RealMessageId;
+                pending.SendStatus = MessageSendStatus.Sent;
+                pending.IsFromAi = e.IsFromAi;
+                pending.Source = e.IsFromAi
+                    ? MessageSource.LocalUserAI
+                    : MessageSource.LocalUserManual;
+                // Do NOT raise MessageReceived — Ack is reconcile-only (no Auto).
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed handling outgoing ack");
+        }
+    }
 
     private void OnBridgeMessage(object? sender, BridgeMessageEvent e)
     {
@@ -319,37 +436,8 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
 
             if (bridgeMsg.IsFromMe)
             {
-                if (_pending.TryMatchEcho(
-                        bridgeMsg.ConversationId,
-                        bridgeMsg.Content,
-                        out var matchSource,
-                        out var clientRequestId))
-                {
-                    // Echo of our own send — update local row if needed, do not raise as remote.
-                    lock (_gate)
-                    {
-                        if (_messages.TryGetValue(bridgeMsg.ConversationId, out var list))
-                        {
-                            var pending = list.FirstOrDefault(m =>
-                                string.Equals(m.ClientRequestId, clientRequestId, StringComparison.Ordinal));
-                            if (pending is not null)
-                            {
-                                pending.Id = bridgeMsg.Id;
-                                pending.SendStatus = MessageSendStatus.Sent;
-                                pending.Source = matchSource == OutgoingMatchSource.AiGenerated
-                                    ? MessageSource.LocalUserAI
-                                    : MessageSource.LocalUserManual;
-                                pending.IsFromAi = matchSource == OutgoingMatchSource.AiGenerated;
-                                return;
-                            }
-                        }
-                    }
-
-                    // Matched but no local row — still skip auto pipeline
-                    return;
-                }
-
-                // Unmatched self message (manual send from phone) — show as self, skip auto
+                // Matched echoes are delivered via OutgoingAcknowledged.
+                // Unmatched self (phone / other client) — show as self, skip auto.
                 var selfMsg = MapMessage(bridgeMsg, raiseSourceFromPending: false);
                 selfMsg.IsSelf = true;
                 selfMsg.Source = MessageSource.LocalUserManual;
@@ -386,7 +474,6 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
         }
 
         // Always raise MessageReceived for UI; MainWindowViewModel skips self/AI for auto.
-        // raiseForAuto kept for clarity / future filtering.
         _ = raiseForAuto;
         MessageReceived?.Invoke(this, new MessageReceivedEventArgs
         {
@@ -464,7 +551,8 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
             FileSize = fileSize,
             ImageUrl = type == MessageType.Image ? localPath : null,
             Timestamp = result.Timestamp == default ? DateTime.Now : result.Timestamp,
-            SendStatus = result.Success ? MessageSendStatus.Sent : MessageSendStatus.Failed
+            // Optimistic Pending until bridge OutgoingAcknowledged.
+            SendStatus = result.Success ? MessageSendStatus.Pending : MessageSendStatus.Failed
         };
     }
 
@@ -479,7 +567,8 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
             AvatarColor = c.IsGroup ? "#6C5CE7" : "#00B894",
             AvatarInitials = Initials(name),
             LastMessage = c.LastMessage ?? string.Empty,
-            LastMessageTime = c.LastMessageTime ?? DateTime.Now,
+            LastMessageTime = c.LastMessageTime ?? DateTime.MinValue,
+            HasLastActivity = c.LastMessageTime.HasValue,
             MemberCount = c.MemberCount,
             IsOnline = true
         };
@@ -492,6 +581,7 @@ public sealed class RealWechatService : IWechatService, IAsyncDisposable
             contact.LastMessage = content;
             contact.LastSender = sender;
             contact.LastMessageTime = timestamp;
+            contact.HasLastActivity = true;
         }
     }
 

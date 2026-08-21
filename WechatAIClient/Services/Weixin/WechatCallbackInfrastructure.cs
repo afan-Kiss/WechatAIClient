@@ -1,7 +1,7 @@
 using System.Buffers.Binary;
-using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -33,7 +33,11 @@ public enum WechatBridgeEventKind
 public sealed class WechatIncomingMessage
 {
     public string MessageId { get; set; } = "";
+    /// <summary>May be provisional until Bridge normalizes with account wxid.</summary>
     public string ConversationId { get; set; } = "";
+    public string? FromWxid { get; set; }
+    public string? ToWxid { get; set; }
+    public string? RoomId { get; set; }
     public string? SenderId { get; set; }
     public string? SenderDisplayName { get; set; }
     public string Content { get; set; } = "";
@@ -81,10 +85,31 @@ public interface IWechatCallbackParser
     IReadOnlyList<WechatBridgeEvent> Parse(string json);
 }
 
+public static class JsonElementExtensions
+{
+    public static bool TryGetPropertyIgnoreCase(this JsonElement element, string name, out JsonElement value)
+    {
+        value = default;
+        if (element.ValueKind != JsonValueKind.Object || string.IsNullOrEmpty(name))
+        {
+            return false;
+        }
+
+        foreach (var prop in element.EnumerateObject())
+        {
+            if (string.Equals(prop.Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                value = prop.Value;
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+
 public sealed class WechatCallbackParser : IWechatCallbackParser
 {
-    private static readonly JsonSerializerOptions Options = new() { PropertyNameCaseInsensitive = true };
-
     public IReadOnlyList<WechatBridgeEvent> Parse(ReadOnlySpan<byte> utf8Json)
     {
         try
@@ -106,36 +131,42 @@ public sealed class WechatCallbackParser : IWechatCallbackParser
 
         using var doc = JsonDocument.Parse(json);
         var root = doc.RootElement;
-        var list = new List<WechatBridgeEvent>();
 
-        // Double-layer JsApiResponse.RespJson
+        // Double-layer JsApiResponse.RespJson — when inner yields events, do not re-parse envelope.
         if (root.ValueKind == JsonValueKind.Object &&
-            root.TryGetProperty("JsApiResponse", out var js) &&
+            root.TryGetPropertyIgnoreCase("JsApiResponse", out var js) &&
             js.ValueKind == JsonValueKind.Object &&
-            js.TryGetProperty("RespJson", out var resp) &&
+            js.TryGetPropertyIgnoreCase("RespJson", out var resp) &&
             resp.ValueKind == JsonValueKind.String)
         {
             var inner = resp.GetString();
-            if (!string.IsNullOrWhiteSpace(inner))
+            if (!string.IsNullOrWhiteSpace(inner) && TryParseInner(inner, out var innerEvents))
             {
-                list.AddRange(ParseInner(inner));
+                if (innerEvents.Count > 0)
+                {
+                    return innerEvents;
+                }
+
+                // Valid empty inner (e.g. msg_list:[]) — still skip envelope to avoid Unknown.
+                return innerEvents;
             }
         }
 
-        list.AddRange(ParseInnerElement(root));
-        return list;
+        return ParseInnerElement(root);
     }
 
-    private static IReadOnlyList<WechatBridgeEvent> ParseInner(string json)
+    private static bool TryParseInner(string json, out IReadOnlyList<WechatBridgeEvent> events)
     {
+        events = Array.Empty<WechatBridgeEvent>();
         try
         {
             using var doc = JsonDocument.Parse(json);
-            return ParseInnerElement(doc.RootElement);
+            events = ParseInnerElement(doc.RootElement);
+            return true;
         }
         catch
         {
-            return Array.Empty<WechatBridgeEvent>();
+            return false;
         }
     }
 
@@ -143,7 +174,7 @@ public sealed class WechatCallbackParser : IWechatCallbackParser
     {
         var results = new List<WechatBridgeEvent>();
         if (root.ValueKind == JsonValueKind.Object &&
-            root.TryGetProperty("msg_list", out var msgList) &&
+            root.TryGetPropertyIgnoreCase("msg_list", out var msgList) &&
             msgList.ValueKind == JsonValueKind.Array)
         {
             foreach (var item in msgList.EnumerateArray())
@@ -158,11 +189,9 @@ public sealed class WechatCallbackParser : IWechatCallbackParser
             return results;
         }
 
-        // Single message object / callback wrappers
         if (root.ValueKind == JsonValueKind.Object)
         {
-            // Common wrappers: data / message / msg
-            if (root.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.Object)
+            if (root.TryGetPropertyIgnoreCase("data", out var data) && data.ValueKind == JsonValueKind.Object)
             {
                 var ev = MapMessageObject(data) ?? MapMessageObject(root);
                 if (ev is not null)
@@ -183,7 +212,8 @@ public sealed class WechatCallbackParser : IWechatCallbackParser
                 results.Add(new WechatBridgeEvent
                 {
                     Kind = WechatBridgeEventKind.Unknown,
-                    RawFingerprint = StableHash(root.GetRawText())
+                    RawFingerprint = ComputeStableFingerprint(
+                        null, null, null, null, null, root.GetRawText())
                 });
             }
         }
@@ -195,24 +225,48 @@ public sealed class WechatCallbackParser : IWechatCallbackParser
     {
         var content = GetString(item, "content", "msg", "text") ?? "";
         var nickname = GetString(item, "nickname", "nick_name", "nickName", "sender_name", "from_name");
-        var senderId = GetString(item, "sender", "from_wxid", "fromUsr", "from_user", "talker", "wxid");
-        var roomId = GetString(item, "room_id", "roomId", "roomid", "chatroom", "to_wxid");
-        var msgId = GetString(item, "msgid", "msg_id", "msgId", "newmsgid", "newMsgId", "id")
-                    ?? StableHash(item.GetRawText());
-        var isGroup = !string.IsNullOrWhiteSpace(roomId) && roomId.Contains("@chatroom", StringComparison.OrdinalIgnoreCase);
-        // Some payloads put conversation in to_user / toUsr
-        var toUser = GetString(item, "to_user", "toUsr", "to_wxid");
-        if (!isGroup && !string.IsNullOrWhiteSpace(toUser) && toUser.Contains("@chatroom", StringComparison.OrdinalIgnoreCase))
+        var fromWxid = GetString(item, "from_wxid", "fromUsr", "from_user", "FromUserName", "sender", "talker");
+        var toWxid = GetString(item, "to_wxid", "toUsr", "to_user", "ToUserName", "to");
+        var roomId = GetString(item, "room_id", "roomId", "roomid", "chatroom", "RoomId");
+        var senderId = fromWxid ?? GetString(item, "wxid");
+        var rawType = GetString(item, "type", "msg_type", "msgType", "MsgType") ?? "1";
+        var timestampRaw = GetString(item, "timestamp", "createTime", "create_time", "time", "CreateTime");
+        var timestamp = ParseTimestampValue(timestampRaw) ?? DateTime.Now;
+
+        var isGroup = IsChatroomId(roomId);
+        if (!isGroup && IsChatroomId(toWxid))
         {
-            roomId = toUser;
+            roomId = toWxid;
             isGroup = true;
         }
 
-        var conversationId = isGroup
-            ? roomId!
-            : (GetString(item, "from_wxid", "talker", "wxid", "fromUsr") ?? senderId ?? "");
+        if (!isGroup && IsChatroomId(fromWxid))
+        {
+            roomId = fromWxid;
+            isGroup = true;
+        }
 
-        if (string.IsNullOrWhiteSpace(conversationId) && string.IsNullOrWhiteSpace(content) && string.IsNullOrWhiteSpace(nickname))
+        // Provisional conversation id — Bridge re-normalizes with account wxid for private chats.
+        var provisionalConversation = isGroup
+            ? roomId!
+            : (fromWxid ?? senderId ?? toWxid ?? "");
+
+        var fingerprint = ComputeStableFingerprint(
+            provisionalConversation,
+            senderId,
+            timestampRaw ?? timestamp.ToString("O"),
+            rawType,
+            content,
+            item.GetRawText());
+
+        var msgId = GetString(item, "msgid", "msg_id", "msgId", "MsgId", "newmsgid", "newMsgId", "id")
+                    ?? fingerprint;
+
+        if (string.IsNullOrWhiteSpace(provisionalConversation) &&
+            string.IsNullOrWhiteSpace(content) &&
+            string.IsNullOrWhiteSpace(nickname) &&
+            string.IsNullOrWhiteSpace(fromWxid) &&
+            string.IsNullOrWhiteSpace(toWxid))
         {
             return null;
         }
@@ -220,24 +274,26 @@ public sealed class WechatCallbackParser : IWechatCallbackParser
         var isSelf = GetBool(item, "is_self", "isSelf", "from_me") ||
                      string.Equals(GetString(item, "type", "msg_type", "msgType"), "self", StringComparison.OrdinalIgnoreCase);
 
-        var rawType = GetString(item, "type", "msg_type", "msgType", "MsgType") ?? "1";
         var mappedType = WechatMessageTypeMapper.Map(rawType, content);
         var kind = ResolveKind(isSelf, isGroup, mappedType);
 
         var message = new WechatIncomingMessage
         {
             MessageId = msgId,
-            ConversationId = conversationId,
+            ConversationId = provisionalConversation,
+            FromWxid = fromWxid,
+            ToWxid = toWxid,
+            RoomId = isGroup ? roomId : null,
             SenderId = senderId,
             SenderDisplayName = nickname,
             Content = content,
-            Timestamp = ParseTimestamp(item) ?? DateTime.Now,
+            Timestamp = timestamp,
             MessageType = mappedType,
             IsFromMe = isSelf,
             IsGroup = isGroup,
             GroupId = isGroup ? roomId : null,
             MentionsMe = GetBool(item, "is_at", "is_at_me", "isAtMe") ||
-                         (content?.Contains("@", StringComparison.Ordinal) ?? false) && GetBool(item, "at_me"),
+                         (content.Contains('@', StringComparison.Ordinal) && GetBool(item, "at_me")),
             QuoteMessageId = GetString(item, "refer_msgid", "referMsgId", "quote_msgid"),
             QuoteContent = GetString(item, "refer_content", "referContent", "quote_content"),
             FileName = GetString(item, "file_name", "filename", "title"),
@@ -250,9 +306,13 @@ public sealed class WechatCallbackParser : IWechatCallbackParser
         {
             Kind = kind,
             Message = message,
-            RawFingerprint = msgId
+            RawFingerprint = fingerprint
         };
     }
+
+    private static bool IsChatroomId(string? id)
+        => !string.IsNullOrWhiteSpace(id) &&
+           id.Contains("@chatroom", StringComparison.OrdinalIgnoreCase);
 
     private static WechatBridgeEventKind ResolveKind(bool isSelf, bool isGroup, string mappedType)
     {
@@ -275,17 +335,19 @@ public sealed class WechatCallbackParser : IWechatCallbackParser
     {
         foreach (var name in names)
         {
-            if (el.TryGetProperty(name, out var p))
+            if (!el.TryGetPropertyIgnoreCase(name, out var p))
             {
-                return p.ValueKind switch
-                {
-                    JsonValueKind.String => p.GetString(),
-                    JsonValueKind.Number => p.ToString(),
-                    JsonValueKind.True => "true",
-                    JsonValueKind.False => "false",
-                    _ => null
-                };
+                continue;
             }
+
+            return p.ValueKind switch
+            {
+                JsonValueKind.String => p.GetString(),
+                JsonValueKind.Number => p.ToString(),
+                JsonValueKind.True => "true",
+                JsonValueKind.False => "false",
+                _ => null
+            };
         }
 
         return null;
@@ -295,7 +357,7 @@ public sealed class WechatCallbackParser : IWechatCallbackParser
     {
         foreach (var name in names)
         {
-            if (!el.TryGetProperty(name, out var p))
+            if (!el.TryGetPropertyIgnoreCase(name, out var p))
             {
                 continue;
             }
@@ -320,9 +382,8 @@ public sealed class WechatCallbackParser : IWechatCallbackParser
         return false;
     }
 
-    private static DateTime? ParseTimestamp(JsonElement el)
+    private static DateTime? ParseTimestampValue(string? raw)
     {
-        var raw = GetString(el, "timestamp", "createTime", "create_time", "time");
         if (string.IsNullOrWhiteSpace(raw))
         {
             return null;
@@ -341,10 +402,27 @@ public sealed class WechatCallbackParser : IWechatCallbackParser
         return DateTime.TryParse(raw, out var dt) ? dt : null;
     }
 
-    private static string StableHash(string text)
+    /// <summary>
+    /// Deterministic SHA256 hex fingerprint (first 32 hex chars). Not GetHashCode.
+    /// Material: conversation|sender|timestamp|type|content|raw
+    /// </summary>
+    public static string ComputeStableFingerprint(
+        string? conversation,
+        string? sender,
+        string? timestamp,
+        string? type,
+        string? content,
+        string? raw)
     {
-        var hash = text.GetHashCode(StringComparison.Ordinal);
-        return $"h{unchecked((uint)hash):x8}";
+        var material = string.Join('|',
+            conversation ?? "",
+            sender ?? "",
+            timestamp ?? "",
+            type ?? "",
+            content ?? "",
+            raw ?? "");
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(material));
+        return Convert.ToHexString(hash).ToLowerInvariant()[..32];
     }
 }
 
@@ -404,6 +482,125 @@ public static class WechatMessageTypeMapper
     }
 }
 
+/// <summary>Copies while rejecting bodies over maxBytes (safe for ContentLength=-1 / chunked).</summary>
+internal sealed class LimitedCopyStream : Stream
+{
+    private readonly Stream _inner;
+    private readonly long _maxBytes;
+    private long _copied;
+
+    public LimitedCopyStream(Stream inner, long maxBytes)
+    {
+        _inner = inner;
+        _maxBytes = maxBytes;
+    }
+
+    public bool ExceededLimit { get; private set; }
+
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position
+    {
+        get => throw new NotSupportedException();
+        set => throw new NotSupportedException();
+    }
+
+    public override void Flush() => _inner.Flush();
+
+    public override int Read(byte[] buffer, int offset, int count)
+        => ReadCore(buffer.AsSpan(offset, count));
+
+    public override int Read(Span<byte> buffer) => ReadCore(buffer);
+
+    private int ReadCore(Span<byte> buffer)
+    {
+        if (ExceededLimit || buffer.Length == 0)
+        {
+            return 0;
+        }
+
+        if (_copied >= _maxBytes)
+        {
+            // Probe one more byte to detect overflow without writing it.
+            Span<byte> probe = stackalloc byte[1];
+            var peek = _inner.Read(probe);
+            if (peek > 0)
+            {
+                ExceededLimit = true;
+            }
+
+            return 0;
+        }
+
+        var allowed = (int)Math.Min(buffer.Length, _maxBytes - _copied);
+        var read = _inner.Read(buffer[..allowed]);
+        if (read > 0)
+        {
+            _copied += read;
+        }
+
+        if (_copied >= _maxBytes)
+        {
+            Span<byte> probe = stackalloc byte[1];
+            var peek = _inner.Read(probe);
+            if (peek > 0)
+            {
+                ExceededLimit = true;
+            }
+        }
+
+        return read;
+    }
+
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+        => ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        if (ExceededLimit || buffer.Length == 0)
+        {
+            return 0;
+        }
+
+        if (_copied >= _maxBytes)
+        {
+            var probe = new byte[1];
+            var peek = await _inner.ReadAsync(probe.AsMemory(0, 1), cancellationToken);
+            if (peek > 0)
+            {
+                ExceededLimit = true;
+            }
+
+            return 0;
+        }
+
+        var allowed = (int)Math.Min(buffer.Length, _maxBytes - _copied);
+        var read = await _inner.ReadAsync(buffer[..allowed], cancellationToken);
+        if (read > 0)
+        {
+            _copied += read;
+        }
+
+        if (_copied >= _maxBytes)
+        {
+            var probe = new byte[1];
+            var peek = await _inner.ReadAsync(probe.AsMemory(0, 1), cancellationToken);
+            if (peek > 0)
+            {
+                ExceededLimit = true;
+            }
+        }
+
+        return read;
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+}
+
 public sealed class WechatHttpCallbackServer : IAsyncDisposable
 {
     private readonly IWechatCallbackParser _parser;
@@ -411,6 +608,7 @@ public sealed class WechatHttpCallbackServer : IAsyncDisposable
     private readonly ILogger<WechatHttpCallbackServer> _logger;
     private readonly int _port;
     private readonly long _maxBodyBytes;
+    private readonly SemaphoreSlim _handlerGate = new(8, 8);
     private HttpListener? _listener;
     private CancellationTokenSource? _cts;
     private Task? _loop;
@@ -515,7 +713,38 @@ public sealed class WechatHttpCallbackServer : IAsyncDisposable
                 break;
             }
 
-            _ = Task.Run(() => HandleAsync(ctx, token), CancellationToken.None);
+            _ = Task.Run(() => HandleWithGateAsync(ctx, token), CancellationToken.None);
+        }
+    }
+
+    private async Task HandleWithGateAsync(HttpListenerContext ctx, CancellationToken token)
+    {
+        try
+        {
+            await _handlerGate.WaitAsync(token);
+        }
+        catch (OperationCanceledException)
+        {
+            try
+            {
+                ctx.Response.StatusCode = 503;
+                ctx.Response.Close();
+            }
+            catch
+            {
+                // ignore
+            }
+
+            return;
+        }
+
+        try
+        {
+            await HandleAsync(ctx, token);
+        }
+        finally
+        {
+            _handlerGate.Release();
         }
     }
 
@@ -531,7 +760,8 @@ public sealed class WechatHttpCallbackServer : IAsyncDisposable
                 return;
             }
 
-            if (ctx.Request.ContentLength64 > _maxBodyBytes)
+            // ContentLength=-1 (chunked) is safe: only reject when known length already over max.
+            if (ctx.Request.ContentLength64 >= 0 && ctx.Request.ContentLength64 > _maxBodyBytes)
             {
                 ctx.Response.StatusCode = 413;
                 await WriteJsonAsync(ctx, """{"error":"body too large"}""");
@@ -539,19 +769,21 @@ public sealed class WechatHttpCallbackServer : IAsyncDisposable
             }
 
             await using var ms = new MemoryStream();
-            await ctx.Request.InputStream.CopyToAsync(ms, token);
-            if (ms.Length > _maxBodyBytes)
+            await using (var limited = new LimitedCopyStream(ctx.Request.InputStream, _maxBodyBytes))
             {
-                ctx.Response.StatusCode = 413;
-                await WriteJsonAsync(ctx, """{"error":"body too large"}""");
-                return;
+                await limited.CopyToAsync(ms, token);
+                if (limited.ExceededLimit)
+                {
+                    ctx.Response.StatusCode = 413;
+                    await WriteJsonAsync(ctx, """{"error":"body too large"}""");
+                    return;
+                }
             }
 
             string json;
             try
             {
                 json = Encoding.UTF8.GetString(ms.ToArray());
-                // validate JSON
                 using var _ = JsonDocument.Parse(json);
             }
             catch
@@ -561,13 +793,24 @@ public sealed class WechatHttpCallbackServer : IAsyncDisposable
                 return;
             }
 
-            // Respond immediately
+            // Respond 200 quickly, then backpressure via WriteAsync (Wait mode).
             ctx.Response.StatusCode = 200;
             await WriteJsonAsync(ctx, """{"status":"success","message":"Data received"}""");
 
             foreach (var ev in _parser.Parse(json))
             {
-                _writer.TryWrite(ev);
+                try
+                {
+                    await _writer.WriteAsync(ev, token);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (ChannelClosedException)
+                {
+                    break;
+                }
             }
         }
         catch (Exception ex)
@@ -575,8 +818,11 @@ public sealed class WechatHttpCallbackServer : IAsyncDisposable
             _logger.LogWarning(ex, "HTTP callback handle failed");
             try
             {
-                ctx.Response.StatusCode = 500;
-                await WriteJsonAsync(ctx, """{"error":"internal"}""");
+                if (ctx.Response.OutputStream.CanWrite)
+                {
+                    ctx.Response.StatusCode = 500;
+                    await WriteJsonAsync(ctx, """{"error":"internal"}""");
+                }
             }
             catch
             {
@@ -733,7 +979,18 @@ public sealed class WechatTcpCallbackServer : IAsyncDisposable
                     var json = Encoding.UTF8.GetString(payload);
                     foreach (var ev in _parser.Parse(json))
                     {
-                        _writer.TryWrite(ev);
+                        try
+                        {
+                            await _writer.WriteAsync(ev, token);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            return;
+                        }
+                        catch (ChannelClosedException)
+                        {
+                            return;
+                        }
                     }
                 }
             }
@@ -748,7 +1005,7 @@ public sealed class WechatTcpCallbackServer : IAsyncDisposable
         }
     }
 
-    internal static async Task ReadExactlyAsync(Stream stream, byte[] buffer, CancellationToken token)
+    public static async Task ReadExactlyAsync(Stream stream, byte[] buffer, CancellationToken token)
     {
         var offset = 0;
         while (offset < buffer.Length)

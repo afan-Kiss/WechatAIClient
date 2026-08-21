@@ -41,11 +41,21 @@ public sealed class BridgeMessageEvent
     public required BridgeMessage Message { get; init; }
 }
 
+public sealed class OutgoingAcknowledgedEvent
+{
+    public required string ClientRequestId { get; init; }
+    public required string RealMessageId { get; init; }
+    public required string ConversationId { get; init; }
+    public required bool IsFromAi { get; init; }
+    public required BridgeMessage Message { get; init; }
+}
+
 public interface IWechatBridgeClient : IAsyncDisposable
 {
     WechatConnectionState State { get; }
     event EventHandler<WechatConnectionState>? StateChanged;
     event EventHandler<BridgeMessageEvent>? MessageReceived;
+    event EventHandler<OutgoingAcknowledgedEvent>? OutgoingAcknowledged;
     event EventHandler? BridgeCrashed;
 
     Task StartAsync(CancellationToken cancellationToken = default);
@@ -63,16 +73,19 @@ public interface IWechatBridgeClient : IAsyncDisposable
         string conversationId,
         string text,
         string clientRequestId,
+        bool isFromAi = false,
         CancellationToken cancellationToken = default);
     Task<SendMessageResult> SendImageAsync(
         string conversationId,
         string localPath,
         string clientRequestId,
+        bool isFromAi = false,
         CancellationToken cancellationToken = default);
     Task<SendMessageResult> SendFileAsync(
         string conversationId,
         string localPath,
         string clientRequestId,
+        bool isFromAi = false,
         CancellationToken cancellationToken = default);
     Task<WechatVersionInfo> DetectVersionAsync(CancellationToken cancellationToken = default);
 }

@@ -281,20 +281,19 @@ public partial class MainWindowViewModel : ViewModelBase
         Chat.Cleanup();
         ContactList.Cleanup();
         AiPanel.CancelGenerationCommand.Execute(null);
-        if (_wechatService is IAsyncDisposable asyncDisposable)
-        {
-            asyncDisposable.DisposeAsync().AsTask().GetAwaiter().GetResult();
-        }
+        // App owns IWechatService Dispose — do not dispose here.
     }
 
     private void RefreshWechatStatus(WechatConnectionState state)
     {
         IsWechatConnected = state == WechatConnectionState.Connected;
-        IsWechatWarning = state is WechatConnectionState.VersionUnsupported
+        IsWechatWarning = state is WechatConnectionState.Degraded
+            or WechatConnectionState.VersionUnsupported
             or WechatConnectionState.BridgeError;
         WechatStatusText = state switch
         {
             WechatConnectionState.Connected => "● 微信已连接",
+            WechatConnectionState.Degraded => "⚠ Hook 已连接，消息回调不可用",
             WechatConnectionState.WechatNotRunning => "○ Hook API 未连接",
             WechatConnectionState.WaitingForLogin => "○ 微信未登录",
             WechatConnectionState.Connecting => "◐ 初始化中…",
