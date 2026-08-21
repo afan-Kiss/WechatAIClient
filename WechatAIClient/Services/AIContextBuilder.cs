@@ -134,7 +134,6 @@ public sealed class AIContextBuilder : IAIContextBuilder
         var summary = BuildSummaryText(
             includeOwn: input.IncludeOwnMessages,
             kept: keptHistory,
-            requested: requested,
             remote: remoteCount,
             own: ownCount,
             pinned: historyMessages.Count(m => m.IsPinned),
@@ -259,16 +258,16 @@ public sealed class AIContextBuilder : IAIContextBuilder
         var list = new List<AIContextMessage>();
         var styleHint = input.ReplyStyle switch
         {
-            ReplyStyle.Concise => "请用简洁风格回复。",
-            ReplyStyle.Formal => "请用正式、礼貌的语气回复。",
-            ReplyStyle.Humorous => "请用轻松幽默的语气回复。",
-            _ => "请用自然口语化的语气回复。"
+            ReplyStyle.Concise => "风格：简短直接，去掉多余客套。",
+            ReplyStyle.Formal => "风格：礼貌、专业、清晰，措辞正式。",
+            ReplyStyle.Humorous => "风格：适度幽默，不冒犯、不夸张。",
+            _ => "风格：自然、口语化，匹配当前聊天语气。"
         };
         var lengthHint = input.ReplyLength switch
         {
-            ReplyLength.Short => "回复尽量简短（一两句）。",
-            ReplyLength.Long => "回复可以稍详细一些。",
-            _ => "回复长度适中。"
+            ReplyLength.Short => "长度：控制在一两句话内。",
+            ReplyLength.Long => "长度：可写得更完整，约三四段以内。",
+            _ => "长度：适中，通常两三句即可。"
         };
 
         list.Add(new AIContextMessage
@@ -321,29 +320,29 @@ public sealed class AIContextBuilder : IAIContextBuilder
     private static string BuildSummaryText(
         bool includeOwn,
         int kept,
-        int requested,
         int remote,
         int own,
         int pinned,
         bool trimmed)
     {
         string core;
-        if (trimmed)
+        if (includeOwn)
         {
-            core = $"本次参考 {kept}/{requested} 条  ·  已按长度自动裁剪";
-        }
-        else if (includeOwn)
-        {
-            core = $"本次参考 {kept} 条  ·  对方 {remote}  ·  自己 {own}";
+            core = $"本次参考 {kept} 条 · 对方 {remote} · 自己 {own}";
         }
         else
         {
-            core = $"本次参考 {kept} 条  ·  仅对方消息";
+            core = $"本次参考 {kept} 条 · 仅对方消息";
         }
 
         if (pinned > 0)
         {
-            core += $"  ·  置顶 {pinned}";
+            core += $" · 📌{pinned}";
+        }
+
+        if (trimmed)
+        {
+            core += " · 已按长度裁剪较早消息";
         }
 
         return core;

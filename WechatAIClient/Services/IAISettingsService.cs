@@ -19,4 +19,7 @@ public interface IAISettingsService
 
     Task<DateTime?> GetAutoPausedUntilAsync(CancellationToken cancellationToken = default);
     Task SetAutoPausedUntilAsync(DateTime? until, CancellationToken cancellationToken = default);
+
+    Task<AIProviderSettings> GetProviderSettingsAsync(CancellationToken cancellationToken = default);
+    Task SaveProviderSettingsAsync(AIProviderSettings settings, CancellationToken cancellationToken = default);
 }

@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Microsoft.Extensions.Logging;
 using WechatAIClient.Models;
 
@@ -20,9 +21,11 @@ public sealed class MockAIService : IAIService
         _logger = logger;
     }
 
-    public string ModelName => "DeepSeek-V3";
+    public string ModelName => "Mock-AI";
 
     public bool IsConnected { get; private set; }
+
+    public AIProviderKind ProviderKind => AIProviderKind.Mock;
 
     public Task ConnectAsync(CancellationToken cancellationToken = default)
     {
@@ -35,9 +38,71 @@ public sealed class MockAIService : IAIService
     public async Task<AIResponse> GenerateAsync(AIRequest request, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        cancellationToken.ThrowIfCancellationRequested();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var content = await BuildReplyAsync(request, cancellationToken);
+        sw.Stop();
 
-        await Task.Delay(700, cancellationToken);
+        return new AIResponse
+        {
+            Content = content,
+            GenerationId = request.GenerationId,
+            ContactId = request.ContactId,
+            RequestId = Guid.NewGuid().ToString("N"),
+            Model = ModelName,
+            Duration = sw.Elapsed,
+            Usage = new AIUsage
+            {
+                PromptTokens = EstimateTokens(request),
+                CompletionTokens = Math.Max(1, content.Length / 2),
+                TotalTokens = EstimateTokens(request) + Math.Max(1, content.Length / 2)
+            },
+            Status = AIGenerationStatus.Completed
+        };
+    }
+
+    public async IAsyncEnumerable<AIStreamEvent> GenerateStreamAsync(
+        AIRequest request,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        var requestId = Guid.NewGuid().ToString("N");
+        var content = await BuildReplyAsync(request, cancellationToken);
+        var index = 0;
+        while (index < content.Length)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var chunk = Math.Min(Random.Shared.Next(3, 8), content.Length - index);
+            var delta = content.Substring(index, chunk);
+            index += chunk;
+            var evt = new AIStreamEvent(delta, IsDone: false, Usage: null, RequestId: requestId);
+            request.OnStreamEvent?.Invoke(evt);
+            yield return evt;
+            await Task.Delay(24, cancellationToken);
+        }
+
+        var usage = new AIUsage
+        {
+            PromptTokens = EstimateTokens(request),
+            CompletionTokens = Math.Max(1, content.Length / 2),
+            TotalTokens = EstimateTokens(request) + Math.Max(1, content.Length / 2)
+        };
+        var done = new AIStreamEvent(null, IsDone: true, Usage: usage, RequestId: requestId);
+        request.OnStreamEvent?.Invoke(done);
+        yield return done;
+    }
+
+    public async Task<AIConnectionTestResult> TestConnectionAsync(CancellationToken cancellationToken = default)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await ConnectAsync(cancellationToken);
+        sw.Stop();
+        return new AIConnectionTestResult(true, "Mock 服务可用", (int)sw.ElapsedMilliseconds, AIErrorKind.None);
+    }
+
+    private async Task<string> BuildReplyAsync(AIRequest request, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        await Task.Delay(120, cancellationToken);
 
         var history = request.Messages?
             .Where(m => !string.Equals(m.Role, "system", StringComparison.OrdinalIgnoreCase))
@@ -68,17 +133,14 @@ public sealed class MockAIService : IAIService
             reply = $"[按指令] {reply}";
         }
 
-        await Task.Delay(120, cancellationToken);
         _logger.LogInformation(
             "Generated mock AI reply with {Count} context messages for {ContactId}",
             history.Count,
             request.ContactId);
 
-        return new AIResponse
-        {
-            Content = reply,
-            GenerationId = request.GenerationId,
-            ContactId = request.ContactId
-        };
+        return reply;
     }
+
+    private static int EstimateTokens(AIRequest request)
+        => Math.Max(1, (request.Messages?.Sum(m => m.Content?.Length ?? 0) ?? 0) / 2);
 }

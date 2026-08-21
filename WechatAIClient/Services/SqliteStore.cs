@@ -6,13 +6,15 @@ namespace WechatAIClient.Services;
 
 public sealed class SqliteStore
 {
-    private const int CurrentSchemaVersion = 3;
+    private const int CurrentSchemaVersion = 4;
+    public const string AiProviderSettingsKey = "ai.provider.json";
     private readonly ILogger<SqliteStore> _logger;
     private readonly string _dbPath;
     private readonly object _gate = new();
     private readonly Dictionary<string, string> _memorySettings = new(StringComparer.Ordinal);
     private readonly List<AIReplyHistoryItem> _memoryHistory = [];
     private string? _memoryGlobalJson;
+    private string? _memoryProviderJson;
     private readonly Dictionary<string, string> _memoryOverrides = new(StringComparer.Ordinal);
     private readonly Dictionary<string, HashSet<string>> _memoryPins = new(StringComparer.Ordinal);
     private bool _useMemoryFallback;
@@ -312,10 +314,36 @@ public sealed class SqliteStore
                 using var bump = connection.CreateCommand();
                 bump.CommandText = "UPDATE schema_version SET version = 3;";
                 bump.ExecuteNonQuery();
+                version = 3;
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to migrate SQLite schema to v3; continuing with defaults");
+            }
+        }
+
+        if (version < 4)
+        {
+            try
+            {
+                using var v4 = connection.CreateCommand();
+                v4.CommandText =
+                    """
+                    CREATE TABLE IF NOT EXISTS ai_provider_settings (
+                        id INTEGER PRIMARY KEY CHECK(id=1),
+                        json TEXT NOT NULL
+                    );
+                    """;
+                v4.ExecuteNonQuery();
+
+                using var bump = connection.CreateCommand();
+                bump.CommandText = "UPDATE schema_version SET version = 4;";
+                bump.ExecuteNonQuery();
+                version = 4;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to migrate SQLite schema to v4; continuing with defaults");
             }
         }
 
@@ -388,6 +416,89 @@ public sealed class SqliteStore
                 """;
             command.Parameters.AddWithValue("$json", json);
             command.ExecuteNonQuery();
+        }, cancellationToken);
+    }
+
+    public Task<string?> GetAiProviderJsonAsync(CancellationToken cancellationToken = default)
+    {
+        if (_useMemoryFallback)
+        {
+            lock (_gate)
+            {
+                if (!string.IsNullOrWhiteSpace(_memoryProviderJson))
+                {
+                    return Task.FromResult<string?>(_memoryProviderJson);
+                }
+
+                return Task.FromResult(
+                    _memorySettings.TryGetValue(AiProviderSettingsKey, out var legacy) ? legacy : (string?)null);
+            }
+        }
+
+        return Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                using var connection = OpenConnection();
+                using var command = connection.CreateCommand();
+                command.CommandText = "SELECT json FROM ai_provider_settings WHERE id = 1 LIMIT 1;";
+                var fromTable = command.ExecuteScalar() as string;
+                if (!string.IsNullOrWhiteSpace(fromTable))
+                {
+                    return fromTable;
+                }
+
+                // Fallback: settings key used before / alongside table
+                using var legacy = connection.CreateCommand();
+                legacy.CommandText = "SELECT value FROM settings WHERE key = $key LIMIT 1;";
+                legacy.Parameters.AddWithValue("$key", AiProviderSettingsKey);
+                return legacy.ExecuteScalar() as string;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "GetAiProviderJson failed");
+                return null;
+            }
+        }, cancellationToken);
+    }
+
+    public Task SetAiProviderJsonAsync(string json, CancellationToken cancellationToken = default)
+    {
+        json ??= "{}";
+        if (_useMemoryFallback)
+        {
+            lock (_gate)
+            {
+                _memoryProviderJson = json;
+                _memorySettings[AiProviderSettingsKey] = json;
+            }
+
+            return Task.CompletedTask;
+        }
+
+        return Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            using var connection = OpenConnection();
+            using var command = connection.CreateCommand();
+            command.CommandText =
+                """
+                INSERT INTO ai_provider_settings(id, json) VALUES(1, $json)
+                ON CONFLICT(id) DO UPDATE SET json = excluded.json;
+                """;
+            command.Parameters.AddWithValue("$json", json);
+            command.ExecuteNonQuery();
+
+            using var mirror = connection.CreateCommand();
+            mirror.CommandText =
+                """
+                INSERT INTO settings(key, value) VALUES($key, $value)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                """;
+            mirror.Parameters.AddWithValue("$key", AiProviderSettingsKey);
+            mirror.Parameters.AddWithValue("$value", json);
+            mirror.ExecuteNonQuery();
         }, cancellationToken);
     }
 
@@ -532,7 +643,7 @@ public sealed class SqliteStore
             lock (_gate)
             {
                 _memoryPins[contactId] = new HashSet<string>(
-                    messageIds.Where(id => !string.IsNullOrWhiteSpace(id)).Take(8),
+                    messageIds.Where(id => !string.IsNullOrWhiteSpace(id)).Take(20),
                     StringComparer.Ordinal);
             }
 
@@ -552,7 +663,7 @@ public sealed class SqliteStore
                 del.ExecuteNonQuery();
             }
 
-            foreach (var messageId in messageIds.Where(id => !string.IsNullOrWhiteSpace(id)).Take(8))
+            foreach (var messageId in messageIds.Where(id => !string.IsNullOrWhiteSpace(id)).Take(20))
             {
                 using var insert = connection.CreateCommand();
                 insert.Transaction = tx;

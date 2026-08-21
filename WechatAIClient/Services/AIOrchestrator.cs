@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using WechatAIClient.Models;
 
@@ -5,11 +6,17 @@ namespace WechatAIClient.Services;
 
 public sealed class AIOrchestrator
 {
+    private const int MaxConcurrent = 3;
+    private const int UiBatchMs = 50;
+
     private readonly IAIService _aiService;
     private readonly IAIContextBuilder _contextBuilder;
     private readonly ILogger<AIOrchestrator> _logger;
+    private readonly SemaphoreSlim _globalGate = new(MaxConcurrent, MaxConcurrent);
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> _perContact = new(StringComparer.Ordinal);
     private readonly object _gate = new();
     private CancellationTokenSource? _cts;
+    private AIGenerationStatus _status = AIGenerationStatus.Idle;
 
     public AIOrchestrator(
         IAIService aiService,
@@ -24,6 +31,24 @@ public sealed class AIOrchestrator
     public AIGenerationRequest? LastRequest { get; private set; }
     public AIContextBuildResult? LastBuildResult { get; private set; }
     public AIRequest? LastAiRequest { get; private set; }
+    public string? ActiveContactId { get; private set; }
+
+    public AIGenerationStatus Status
+    {
+        get => _status;
+        private set
+        {
+            if (_status == value)
+            {
+                return;
+            }
+
+            _status = value;
+            StatusChanged?.Invoke(this, EventArgs.Empty);
+        }
+    }
+
+    public event EventHandler? StatusChanged;
 
     public void CancelAll() => CancelCurrentGeneration();
 
@@ -39,9 +64,43 @@ public sealed class AIOrchestrator
             {
                 // ignored
             }
+        }
 
-            _cts?.Dispose();
-            _cts = null;
+        foreach (var pair in _perContact)
+        {
+            try
+            {
+                pair.Value.Cancel();
+            }
+            catch
+            {
+                // ignored
+            }
+        }
+
+        if (Status is AIGenerationStatus.PreparingContext or AIGenerationStatus.Connecting or AIGenerationStatus.Streaming)
+        {
+            Status = AIGenerationStatus.Cancelled;
+        }
+    }
+
+    public void CancelContactGeneration(string contactId)
+    {
+        if (string.IsNullOrWhiteSpace(contactId))
+        {
+            return;
+        }
+
+        if (_perContact.TryGetValue(contactId, out var cts))
+        {
+            try
+            {
+                cts.Cancel();
+            }
+            catch
+            {
+                // ignored
+            }
         }
     }
 
@@ -51,19 +110,32 @@ public sealed class AIOrchestrator
         CancellationToken linked = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        CancelAll();
+        if (string.IsNullOrWhiteSpace(request.ContactId))
+        {
+            throw new ArgumentException("ContactId is required", nameof(request));
+        }
+
+        // Per-contact: cancel previous generation for same contact
+        CancelContactGeneration(request.ContactId);
 
         var localCts = CancellationTokenSource.CreateLinkedTokenSource(linked);
+        _perContact[request.ContactId] = localCts;
         lock (_gate)
         {
             _cts = localCts;
         }
 
         LastRequest = request;
+        ActiveContactId = request.ContactId;
         var token = localCts.Token;
+        var acquired = false;
 
         try
         {
+            Status = AIGenerationStatus.PreparingContext;
+            await _globalGate.WaitAsync(token);
+            acquired = true;
+
             var buildInput = new AIContextBuildInput
             {
                 ContactId = request.ContactId,
@@ -95,39 +167,89 @@ public sealed class AIOrchestrator
             };
             LastAiRequest = aiRequest;
 
-            var response = await _aiService.GenerateAsync(aiRequest, token);
-            if (token.IsCancellationRequested || response is null || string.IsNullOrEmpty(response.Content))
+            Status = AIGenerationStatus.Connecting;
+            var content = new System.Text.StringBuilder();
+            var lastFlush = DateTime.UtcNow;
+            string? flushSnapshot = null;
+
+            Status = AIGenerationStatus.Streaming;
+            await foreach (var evt in _aiService.GenerateStreamAsync(aiRequest, token))
             {
-                return null;
+                if (!string.IsNullOrEmpty(evt.DeltaContent))
+                {
+                    content.Append(evt.DeltaContent);
+                }
+
+                var now = DateTime.UtcNow;
+                if (onTypingChunk is not null &&
+                    ((now - lastFlush).TotalMilliseconds >= UiBatchMs || evt.IsDone))
+                {
+                    flushSnapshot = content.ToString();
+                    onTypingChunk(flushSnapshot);
+                    lastFlush = now;
+                }
+
+                if (evt.IsDone)
+                {
+                    break;
+                }
             }
 
-            await AnimateTypingAsync(response.Content, onTypingChunk, token);
             if (token.IsCancellationRequested)
             {
+                Status = AIGenerationStatus.Cancelled;
                 return null;
             }
 
+            var full = content.ToString();
+            if (string.IsNullOrEmpty(full))
+            {
+                Status = AIGenerationStatus.Failed;
+                return null;
+            }
+
+            if (onTypingChunk is not null && flushSnapshot != full)
+            {
+                onTypingChunk(full);
+            }
+
+            Status = AIGenerationStatus.Completed;
             return new AIGenerationResult
             {
                 GenerationId = request.GenerationId,
                 ContactId = request.ContactId,
-                Content = response.Content,
+                Content = full,
                 DraftRevisionAtStart = request.DraftRevisionAtStart,
-                ContextSummary = buildResult.SummaryText
+                ContextSummary = buildResult.SummaryText,
+                Status = AIGenerationStatus.Completed
             };
         }
         catch (OperationCanceledException)
         {
+            Status = AIGenerationStatus.Cancelled;
             _logger.LogDebug("AI generation cancelled for {ContactId}", request.ContactId);
             return null;
         }
+        catch (AIServiceException ex)
+        {
+            Status = AIGenerationStatus.Failed;
+            _logger.LogError(ex, "AI generation failed for {ContactId}: {Kind}", request.ContactId, ex.Kind);
+            throw;
+        }
         catch (Exception ex)
         {
+            Status = AIGenerationStatus.Failed;
             _logger.LogError(ex, "AI generation failed for {ContactId}", request.ContactId);
             throw;
         }
         finally
         {
+            if (acquired)
+            {
+                _globalGate.Release();
+            }
+
+            _perContact.TryRemove(request.ContactId, out _);
             lock (_gate)
             {
                 if (ReferenceEquals(_cts, localCts))
@@ -136,31 +258,16 @@ public sealed class AIOrchestrator
                 }
             }
 
+            if (ActiveContactId == request.ContactId)
+            {
+                ActiveContactId = null;
+            }
+
             localCts.Dispose();
-        }
-    }
-
-    private static async Task AnimateTypingAsync(
-        string text,
-        Action<string>? onTypingChunk,
-        CancellationToken cancellationToken)
-    {
-        if (onTypingChunk is null)
-        {
-            return;
-        }
-
-        var preview = string.Empty;
-        var random = Random.Shared;
-        var index = 0;
-        while (index < text.Length)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var chunk = Math.Min(random.Next(4, 9), text.Length - index);
-            preview += text.Substring(index, chunk);
-            index += chunk;
-            onTypingChunk(preview);
-            await Task.Delay(18, cancellationToken);
+            if (Status is AIGenerationStatus.PreparingContext or AIGenerationStatus.Connecting or AIGenerationStatus.Streaming)
+            {
+                Status = AIGenerationStatus.Idle;
+            }
         }
     }
 }

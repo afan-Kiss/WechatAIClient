@@ -10,6 +10,7 @@ using WechatAIClient.Models;
 using WechatAIClient.Services;
 using WechatAIClient.Services.Logging;
 using WechatAIClient.Services.Mock;
+using WechatAIClient.Services.DeepSeek;
 using WechatAIClient.ViewModels;
 using WechatAIClient.Views;
 
@@ -109,7 +110,10 @@ public partial class App : Application
         services.AddSingleton<IToastService, ToastService>();
         services.AddSingleton<IFilePickerService, AvaloniaFilePickerService>();
         services.AddSingleton<IWechatService, MockWechatService>();
-        services.AddSingleton<IAIService, MockAIService>();
+        services.AddHttpClient(DeepSeekAIService.HttpClientName);
+        services.AddSingleton<MockAIService>();
+        services.AddSingleton<DeepSeekAIService>();
+        services.AddSingleton<IAIService, RoutingAIService>();
         services.AddSingleton<IAIContextBuilder, AIContextBuilder>();
         services.AddSingleton<IAISettingsService, AISettingsService>();
         services.AddSingleton<AIOrchestrator>();

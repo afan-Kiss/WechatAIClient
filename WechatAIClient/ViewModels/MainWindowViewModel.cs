@@ -5,6 +5,7 @@ using Microsoft.Extensions.Logging;
 using WechatAIClient.Helpers;
 using WechatAIClient.Models;
 using WechatAIClient.Services;
+using WechatAIClient.Services.DeepSeek;
 
 namespace WechatAIClient.ViewModels;
 
@@ -13,6 +14,8 @@ public partial class MainWindowViewModel : ViewModelBase
     private readonly IThemeService _themeService;
     private readonly IWechatService _wechatService;
     private readonly IAISettingsService _aiSettings;
+    private readonly ISecretStore _secrets;
+    private readonly IAIService _aiService;
     private readonly IToastService _toast;
     private readonly ILogger<MainWindowViewModel> _logger;
     private readonly Dictionary<string, CancellationTokenSource> _autoDebounce = new(StringComparer.Ordinal);
@@ -30,6 +33,8 @@ public partial class MainWindowViewModel : ViewModelBase
         IThemeService themeService,
         IWechatService wechatService,
         IAISettingsService aiSettings,
+        ISecretStore secrets,
+        IAIService aiService,
         IToastService toast,
         ILogger<MainWindowViewModel> logger)
     {
@@ -39,6 +44,8 @@ public partial class MainWindowViewModel : ViewModelBase
         _themeService = themeService;
         _wechatService = wechatService;
         _aiSettings = aiSettings;
+        _secrets = secrets;
+        _aiService = aiService;
         _toast = toast;
         _logger = logger;
         SelectedThemeMode = themeService.CurrentMode;
@@ -84,6 +91,8 @@ public partial class MainWindowViewModel : ViewModelBase
     public ChatViewModel Chat { get; }
     public AIPanelViewModel AiPanel { get; }
 
+    public IReadOnlyList<AIModelDescriptor> AvailableAiModels { get; } = DeepSeekModels.All;
+
     [ObservableProperty]
     private bool _isSettingsOpen;
 
@@ -123,20 +132,60 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty]
     private bool _isToastVisible;
 
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsProviderMock))]
+    [NotifyPropertyChangedFor(nameof(IsProviderDeepSeek))]
+    private AIProviderKind _settingsAiProvider = AIProviderKind.Mock;
+
+    public bool IsProviderMock => SettingsAiProvider == AIProviderKind.Mock;
+    public bool IsProviderDeepSeek => SettingsAiProvider == AIProviderKind.DeepSeek;
+
+    [ObservableProperty]
+    private string _settingsAiModelId = "deepseek-v4-flash";
+
+    [ObservableProperty]
+    private string _settingsApiKey = string.Empty;
+
+    [ObservableProperty]
+    private bool _settingsShowApiKey;
+
+    [ObservableProperty]
+    private string _settingsBaseUrl = "https://api.deepseek.com";
+
+    [ObservableProperty]
+    private int _settingsTimeoutSeconds = 45;
+
+    [ObservableProperty]
+    private int _settingsMaxTokens = 2048;
+
+    [ObservableProperty]
+    private double _settingsTemperature = 0.7;
+
+    [ObservableProperty]
+    private bool _settingsStreaming = true;
+
+    [ObservableProperty]
+    private bool _isAiAdvancedExpanded;
+
+    [ObservableProperty]
+    private string _settingsConnectionMessage = string.Empty;
+
+    [ObservableProperty]
+    private bool _isTestingConnection;
+
     public async Task InitializeAsync()
     {
         try
         {
             await _themeService.RestoreAsync();
             SelectedThemeMode = _themeService.CurrentMode;
+            await LoadAiProviderSettingsAsync();
             await ContactList.InitializeAsync();
             await AiPanel.InitializeAsync();
             if (ContactList.SelectedContact is { } selected)
             {
                 await AiPanel.BindContactAsync(selected.Id);
             }
-            // SelectedContact set during ContactList.Initialize fires ContactSelected -> LoadContactAsync.
-            // Do not call Chat.LoadContactAsync again here.
         }
         catch (Exception ex)
         {
@@ -200,6 +249,7 @@ public partial class MainWindowViewModel : ViewModelBase
         if (IsSettingsOpen)
         {
             NavIndex = 3;
+            LoadAiProviderSettingsAsync().SafeFireAndForget(_logger);
         }
     }
 
@@ -235,6 +285,10 @@ public partial class MainWindowViewModel : ViewModelBase
 
         NavIndex = index;
         IsSettingsOpen = index == 3;
+        if (IsSettingsOpen)
+        {
+            LoadAiProviderSettingsAsync().SafeFireAndForget(_logger);
+        }
 
         if (index == 1)
         {
@@ -251,6 +305,97 @@ public partial class MainWindowViewModel : ViewModelBase
 
     [RelayCommand]
     private void CollapseAiPanel() => IsAiPanelVisible = false;
+
+    [RelayCommand]
+    private void SetAiProvider(string provider)
+    {
+        SettingsAiProvider = string.Equals(provider, "DeepSeek", StringComparison.OrdinalIgnoreCase)
+            ? AIProviderKind.DeepSeek
+            : AIProviderKind.Mock;
+    }
+
+    [RelayCommand]
+    private void ToggleAiAdvanced() => IsAiAdvancedExpanded = !IsAiAdvancedExpanded;
+
+    [RelayCommand]
+    private void ToggleShowApiKey() => SettingsShowApiKey = !SettingsShowApiKey;
+
+    [RelayCommand]
+    private async Task SaveAiProviderSettingsAsync()
+    {
+        try
+        {
+            await _aiSettings.SaveProviderSettingsAsync(CaptureProviderSettings());
+            if (!string.IsNullOrWhiteSpace(SettingsApiKey))
+            {
+                await _secrets.SetSecretAsync(DeepSeekAIService.ApiKeySecretName, SettingsApiKey.Trim());
+            }
+
+            await AiPanel.RefreshConnectionStateAsync();
+            await _toast.ShowAsync("AI 设置已保存");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to save AI provider settings");
+            await _toast.ShowAsync("保存失败");
+        }
+    }
+
+    [RelayCommand]
+    private async Task ClearApiKeyAsync()
+    {
+        try
+        {
+            await _secrets.DeleteSecretAsync(DeepSeekAIService.ApiKeySecretName);
+            SettingsApiKey = string.Empty;
+            await AiPanel.RefreshConnectionStateAsync(connectedHint: false);
+            SettingsConnectionMessage = "API Key 已清除";
+            await _toast.ShowAsync("API Key 已清除");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to clear API key");
+            await _toast.ShowAsync("清除失败");
+        }
+    }
+
+    [RelayCommand]
+    private async Task TestAiConnectionAsync()
+    {
+        if (IsTestingConnection)
+        {
+            return;
+        }
+
+        IsTestingConnection = true;
+        SettingsConnectionMessage = "测试中…";
+        try
+        {
+            await _aiSettings.SaveProviderSettingsAsync(CaptureProviderSettings());
+            if (SettingsAiProvider == AIProviderKind.DeepSeek && !string.IsNullOrWhiteSpace(SettingsApiKey))
+            {
+                await _secrets.SetSecretAsync(DeepSeekAIService.ApiKeySecretName, SettingsApiKey.Trim());
+            }
+
+            var result = await _aiService.TestConnectionAsync();
+            SettingsConnectionMessage = result.Success
+                ? $"{result.Message}（{result.LatencyMs} ms）"
+                : result.Message;
+            await AiPanel.RefreshConnectionStateAsync(connectedHint: result.Success);
+            await _toast.ShowAsync(result.Success ? "连接成功" : result.Message);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "AI connection test failed");
+            SettingsConnectionMessage = "连接失败";
+            await AiPanel.RefreshConnectionStateAsync(connectedHint: false);
+            await _toast.ShowAsync("连接失败");
+        }
+        finally
+        {
+            IsTestingConnection = false;
+        }
+    }
 
     [RelayCommand]
     private async Task NotifyPhase2Async(string? feature)
@@ -312,11 +457,14 @@ public partial class MainWindowViewModel : ViewModelBase
                 : AiPanel.TemporaryInstruction,
             PinnedMessageIds = pins,
             DraftRevisionAtStart = draftRevision,
-            IsGroup = contact.Type == ContactType.Group
+            IsGroup = contact.Type == ContactType.Group,
+            TemporarilyExcludedMessageIds = AiPanel.TemporarilyExcludedMessageIds.Count > 0
+                ? new HashSet<string>(AiPanel.TemporarilyExcludedMessageIds, StringComparer.Ordinal)
+                : null
         };
 
         var result = await AiPanel.GenerateForContactDetailedAsync(request);
-        if (result is null)
+        if (result is null || result.Status != AIGenerationStatus.Completed)
         {
             return;
         }
@@ -328,6 +476,39 @@ public partial class MainWindowViewModel : ViewModelBase
         else if (AiPanel.ReplyMode == AIReplyMode.ManualConfirm)
         {
             await ApplyManualConfirmResultAsync(contact.Id, result.Content, draftRevision);
+        }
+    }
+
+    private AIProviderSettings CaptureProviderSettings() => new()
+    {
+        Provider = SettingsAiProvider,
+        ModelId = string.IsNullOrWhiteSpace(SettingsAiModelId) ? "deepseek-v4-flash" : SettingsAiModelId.Trim(),
+        BaseUrl = string.IsNullOrWhiteSpace(SettingsBaseUrl) ? "https://api.deepseek.com" : SettingsBaseUrl.Trim(),
+        RequestTimeoutSeconds = SettingsTimeoutSeconds,
+        MaxOutputTokens = SettingsMaxTokens,
+        Temperature = SettingsTemperature,
+        Streaming = SettingsStreaming
+    };
+
+    private async Task LoadAiProviderSettingsAsync()
+    {
+        try
+        {
+            var settings = await _aiSettings.GetProviderSettingsAsync();
+            SettingsAiProvider = settings.Provider;
+            SettingsAiModelId = settings.ModelId;
+            SettingsBaseUrl = settings.BaseUrl;
+            SettingsTimeoutSeconds = settings.RequestTimeoutSeconds;
+            SettingsMaxTokens = settings.MaxOutputTokens;
+            SettingsTemperature = settings.Temperature;
+            SettingsStreaming = settings.Streaming;
+
+            var key = await _secrets.GetSecretAsync(DeepSeekAIService.ApiKeySecretName);
+            SettingsApiKey = key ?? string.Empty;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to load AI provider settings");
         }
     }
 
@@ -441,8 +622,6 @@ public partial class MainWindowViewModel : ViewModelBase
             var replyMode = autoSend ? AIReplyMode.Auto : AIReplyMode.ManualConfirm;
             var draftRevision = Chat.CurrentContact?.Id == contactId ? Chat.DraftRevision : (int?)null;
             var pins = await _aiSettings.GetPinnedIdsAsync(contactId, cancellationToken);
-
-            // Refresh effective settings for this contact when auto-firing
             var effective = await _aiSettings.GetEffectiveAsync(contactId, cancellationToken);
 
             var request = new AIGenerationRequest
@@ -464,7 +643,9 @@ public partial class MainWindowViewModel : ViewModelBase
             };
 
             var result = await AiPanel.GenerateForContactDetailedAsync(request);
-            if (result is null || cancellationToken.IsCancellationRequested)
+            if (result is null ||
+                result.Status != AIGenerationStatus.Completed ||
+                cancellationToken.IsCancellationRequested)
             {
                 return;
             }

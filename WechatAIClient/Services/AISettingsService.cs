@@ -10,7 +10,7 @@ public sealed class AISettingsService : IAISettingsService
     private const string ContextLengthKey = "ai.contextLength";
     private const string AutoGenerateKey = "ai.autoGenerateOnReceive";
     private const string AutoPauseKey = "ai.autoPausedUntil";
-    private const int MaxPins = 8;
+    private const int MaxPins = 20;
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -203,7 +203,7 @@ public sealed class AISettingsService : IAISettingsService
 
         if (pins.Count >= MaxPins)
         {
-            pins.RemoveAt(0);
+            return false;
         }
 
         pins.Add(messageId);
@@ -238,6 +238,37 @@ public sealed class AISettingsService : IAISettingsService
     {
         var value = until?.ToString("O") ?? string.Empty;
         await _settings.SetAsync(AutoPauseKey, value, cancellationToken);
+    }
+
+    public async Task<AIProviderSettings> GetProviderSettingsAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var json = await _store.GetAiProviderJsonAsync(cancellationToken);
+            if (!string.IsNullOrWhiteSpace(json))
+            {
+                var parsed = JsonSerializer.Deserialize<AIProviderSettings>(json, JsonOptions);
+                if (parsed is not null)
+                {
+                    NormalizeProvider(parsed);
+                    return parsed;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to read AI provider settings");
+        }
+
+        return new AIProviderSettings();
+    }
+
+    public async Task SaveProviderSettingsAsync(AIProviderSettings settings, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        NormalizeProvider(settings);
+        var json = JsonSerializer.Serialize(settings, JsonOptions);
+        await _store.SetAiProviderJsonAsync(json, cancellationToken);
     }
 
     private async Task EnsureLegacyMigratedAsync(CancellationToken cancellationToken)
@@ -290,5 +321,24 @@ public sealed class AISettingsService : IAISettingsService
     private static void Normalize(AIGlobalSettings settings)
     {
         settings.ContextCount = Math.Clamp(settings.ContextCount <= 0 ? 10 : settings.ContextCount, 1, 100);
+    }
+
+    private static void NormalizeProvider(AIProviderSettings settings)
+    {
+        if (string.IsNullOrWhiteSpace(settings.BaseUrl))
+        {
+            settings.BaseUrl = "https://api.deepseek.com";
+        }
+
+        if (string.IsNullOrWhiteSpace(settings.ModelId))
+        {
+            settings.ModelId = "deepseek-v4-flash";
+        }
+
+        settings.RequestTimeoutSeconds = Math.Clamp(
+            settings.RequestTimeoutSeconds <= 0 ? 45 : settings.RequestTimeoutSeconds, 5, 300);
+        settings.MaxOutputTokens = Math.Clamp(
+            settings.MaxOutputTokens <= 0 ? 2048 : settings.MaxOutputTokens, 16, 8192);
+        settings.Temperature = Math.Clamp(settings.Temperature, 0, 2);
     }
 }

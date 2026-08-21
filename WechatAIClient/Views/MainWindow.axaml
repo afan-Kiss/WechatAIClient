@@ -320,84 +320,110 @@
                                          FontSize="11"
                                          Margin="4,0,0,4"
                                          TextTrimming="CharacterEllipsis" />
-                              <controls:ChatBubble IsSelf="{Binding IsSelf}">
-                                <StackPanel Spacing="8">
-                                  <Border IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=Quote}"
-                                          Background="{DynamicResource QuoteBackgroundBrush}"
-                                          CornerRadius="8"
-                                          Padding="8">
-                                    <StackPanel>
-                                      <TextBlock Text="{Binding QuoteSender}"
-                                                 FontSize="11"
-                                                 Foreground="{DynamicResource AccentBrush}"
-                                                 TextTrimming="CharacterEllipsis" />
-                                      <TextBlock Text="{Binding QuoteContent}"
-                                                 FontSize="12"
-                                                 Foreground="{DynamicResource TextSecondaryBrush}"
-                                                 TextWrapping="Wrap" />
-                                    </StackPanel>
-                                  </Border>
-
-                                  <Border IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=Image}"
-                                          MaxHeight="240"
-                                          CornerRadius="10"
-                                          ClipToBounds="True"
-                                          Background="{DynamicResource AccentGradientBrush}">
-                                    <Panel>
-                                      <TextBlock Text="🖼 图片预览"
-                                                 Foreground="White"
-                                                 HorizontalAlignment="Center"
-                                                 VerticalAlignment="Center"
-                                                 Margin="24" />
-                                      <Image Source="{Binding ImageUrl}"
-                                             MaxHeight="240"
-                                             Stretch="Uniform"
-                                             HorizontalAlignment="Center"
-                                             VerticalAlignment="Center" />
-                                    </Panel>
-                                  </Border>
-
-                                  <Border IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=File}"
-                                          Background="{DynamicResource QuoteBackgroundBrush}"
-                                          CornerRadius="10"
-                                          Padding="12"
-                                          MaxWidth="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Chat.BubbleMaxWidth}">
-                                    <Grid ColumnDefinitions="Auto,*">
-                                      <Border Width="36"
-                                              Height="36"
-                                              CornerRadius="8"
-                                              Margin="0,0,10,0"
-                                              Background="{DynamicResource AccentBrush}">
-                                        <TextBlock Text="FILE"
-                                                   Foreground="White"
-                                                   FontSize="9"
-                                                   HorizontalAlignment="Center"
-                                                   VerticalAlignment="Center" />
-                                      </Border>
-                                      <StackPanel Grid.Column="1" MinWidth="0">
-                                        <TextBlock Text="{Binding FileName}"
-                                                   FontWeight="SemiBold"
-                                                   FontSize="13"
-                                                   MinWidth="0"
-                                                   TextTrimming="CharacterEllipsis"
-                                                   TextWrapping="NoWrap" />
-                                        <TextBlock Text="{Binding FileSize}"
-                                                   Foreground="{DynamicResource TextMutedBrush}"
-                                                   FontSize="11" />
+                              <Panel>
+                                <controls:ChatBubble IsSelf="{Binding IsSelf}">
+                                  <controls:ChatBubble.ContextMenu>
+                                    <ContextMenu>
+                                      <MenuItem Header="📌 固定为 AI 参考"
+                                                IsVisible="{Binding !IsPinned}"
+                                                Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Chat.PinMessageCommand}"
+                                                CommandParameter="{Binding}" />
+                                      <MenuItem Header="📌 取消固定"
+                                                IsVisible="{Binding IsPinned}"
+                                                Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Chat.UnpinMessageCommand}"
+                                                CommandParameter="{Binding}" />
+                                    </ContextMenu>
+                                  </controls:ChatBubble.ContextMenu>
+                                  <StackPanel Spacing="8">
+                                    <TextBlock Text="📌"
+                                               FontSize="10"
+                                               Opacity="0.7"
+                                               HorizontalAlignment="Right"
+                                               IsVisible="{Binding IsPinned}"
+                                               Margin="0,0,0,-4" />
+                                    <Border IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=Quote}"
+                                            Background="{DynamicResource QuoteBackgroundBrush}"
+                                            CornerRadius="8"
+                                            Padding="8">
+                                      <StackPanel>
+                                        <TextBlock Text="{Binding QuoteSender}"
+                                                   FontSize="11"
+                                                   Foreground="{DynamicResource AccentBrush}"
+                                                   TextTrimming="CharacterEllipsis" />
+                                        <TextBlock Text="{Binding QuoteContent}"
+                                                   FontSize="12"
+                                                   Foreground="{DynamicResource TextSecondaryBrush}"
+                                                   TextWrapping="Wrap" />
                                       </StackPanel>
-                                    </Grid>
-                                  </Border>
+                                    </Border>
 
-                                  <TextBlock Text="{Binding Content}"
-                                             TextWrapping="Wrap"
-                                             FontSize="14"
-                                             IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=Text}" />
-                                  <TextBlock Text="{Binding Content}"
-                                             TextWrapping="Wrap"
-                                             FontSize="14"
-                                             IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=Quote}" />
-                                </StackPanel>
-                              </controls:ChatBubble>
+                                    <Border IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=Image}"
+                                            MaxHeight="240"
+                                            CornerRadius="10"
+                                            ClipToBounds="True"
+                                            Background="{DynamicResource AccentGradientBrush}">
+                                      <Panel>
+                                        <TextBlock Text="🖼 图片预览"
+                                                   Foreground="White"
+                                                   HorizontalAlignment="Center"
+                                                   VerticalAlignment="Center"
+                                                   Margin="24" />
+                                        <Image Source="{Binding ImageUrl}"
+                                               MaxHeight="240"
+                                               Stretch="Uniform"
+                                               HorizontalAlignment="Center"
+                                               VerticalAlignment="Center" />
+                                      </Panel>
+                                    </Border>
+
+                                    <Border IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=File}"
+                                            Background="{DynamicResource QuoteBackgroundBrush}"
+                                            CornerRadius="10"
+                                            Padding="12"
+                                            MaxWidth="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Chat.BubbleMaxWidth}">
+                                      <Grid ColumnDefinitions="Auto,*">
+                                        <Border Width="36"
+                                                Height="36"
+                                                CornerRadius="8"
+                                                Margin="0,0,10,0"
+                                                Background="{DynamicResource AccentBrush}">
+                                          <TextBlock Text="FILE"
+                                                     Foreground="White"
+                                                     FontSize="9"
+                                                     HorizontalAlignment="Center"
+                                                     VerticalAlignment="Center" />
+                                        </Border>
+                                        <StackPanel Grid.Column="1" MinWidth="0">
+                                          <TextBlock Text="{Binding FileName}"
+                                                     FontWeight="SemiBold"
+                                                     FontSize="13"
+                                                     MinWidth="0"
+                                                     TextTrimming="CharacterEllipsis"
+                                                     TextWrapping="NoWrap" />
+                                          <TextBlock Text="{Binding FileSize}"
+                                                     Foreground="{DynamicResource TextMutedBrush}"
+                                                     FontSize="11" />
+                                        </StackPanel>
+                                      </Grid>
+                                    </Border>
+
+                                    <TextBlock Text="{Binding Content}"
+                                               TextWrapping="Wrap"
+                                               FontSize="14"
+                                               IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=Text}" />
+                                    <TextBlock Text="{Binding Content}"
+                                               TextWrapping="Wrap"
+                                               FontSize="14"
+                                               IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=Quote}" />
+                                  </StackPanel>
+                                </controls:ChatBubble>
+                                <TextBlock Text="📌"
+                                           FontSize="11"
+                                           Margin="4,0,0,0"
+                                           HorizontalAlignment="Right"
+                                           VerticalAlignment="Top"
+                                           IsVisible="{Binding IsPinned}" />
+                              </Panel>
                             </StackPanel>
                           </DockPanel>
                         </StackPanel>
@@ -553,6 +579,10 @@
                              FontSize="12"
                              Foreground="{DynamicResource SuccessBrush}"
                              IsVisible="{Binding IsConnected}" />
+                  <TextBlock Text="{Binding StatusText}"
+                             FontSize="11"
+                             Foreground="{DynamicResource TextMutedBrush}"
+                             IsVisible="{Binding IsGenerating}" />
                   <Button Classes="glass-button"
                           Padding="8,4"
                           Content="连接"
@@ -636,12 +666,25 @@
                              PlaceholderText="本次回复要求（可选）"
                              MinWidth="0"
                              FontSize="12"
+                             AcceptsReturn="True"
+                             TextWrapping="Wrap"
                              Background="{DynamicResource InputBackgroundBrush}"
                              Foreground="{DynamicResource TextBrush}"
                              BorderBrush="{DynamicResource GlassBorderBrush}"
                              BorderThickness="1"
                              CornerRadius="8"
-                             Padding="8,6" />
+                             Padding="8,6"
+                             KeyDown="AiInstruction_OnKeyDown" />
+                    <WrapPanel ItemSpacing="6" LineSpacing="6">
+                      <Button Classes="glass-button" FontSize="10" Padding="8,3" Content="委婉一点"
+                              Command="{Binding ApplyInstructionChipCommand}" CommandParameter="委婉一点" />
+                      <Button Classes="glass-button" FontSize="10" Padding="8,3" Content="简短回复"
+                              Command="{Binding ApplyInstructionChipCommand}" CommandParameter="简短回复" />
+                      <Button Classes="glass-button" FontSize="10" Padding="8,3" Content="更口语"
+                              Command="{Binding ApplyInstructionChipCommand}" CommandParameter="更口语" />
+                      <Button Classes="glass-button" FontSize="10" Padding="8,3" Content="明确拒绝"
+                              Command="{Binding ApplyInstructionChipCommand}" CommandParameter="明确拒绝" />
+                    </WrapPanel>
 
                     <Grid ColumnDefinitions="*,Auto" MinWidth="0">
                       <TextBlock Text="{Binding ContextSummaryText}"
@@ -810,11 +853,12 @@
           </controls:GlassCard>
 
           <!-- Context preview overlay -->
-          <Border Grid.ColumnSpan="3"
-                  IsVisible="{Binding AiPanel.IsContextPreviewOpen}"
-                  Background="#99000000"
-                  ZIndex="25">
-            <Border Width="420" MaxHeight="520"
+          <Grid Grid.ColumnSpan="3"
+                IsVisible="{Binding AiPanel.IsContextPreviewOpen}"
+                ZIndex="25">
+            <Border Background="#99000000"
+                    PointerPressed="ContextPreviewMask_OnPointerPressed" />
+            <Border Width="420" MaxHeight="560"
                     HorizontalAlignment="Right" VerticalAlignment="Center"
                     Margin="0,0,24,0"
                     Background="{DynamicResource PanelBrush}"
@@ -835,6 +879,14 @@
                     <TextBlock Text="{Binding ContextSummaryText}" FontSize="12"
                                TextWrapping="Wrap"
                                Foreground="{DynamicResource TextMutedBrush}" />
+                    <TextBlock Text="{Binding TokenEstimateText}" FontSize="11"
+                               Foreground="{DynamicResource TextMutedBrush}" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                      <Button Classes="glass-button" Content="全选" FontSize="11"
+                              Command="{Binding SelectAllPreviewCommand}" />
+                      <Button Classes="glass-button" Content="恢复默认" FontSize="11"
+                              Command="{Binding ResetPreviewExclusionsCommand}" />
+                    </StackPanel>
                     <TextBlock Text="{Binding TemporaryInstruction, StringFormat=临时要求：{0}}"
                                IsVisible="{Binding TemporaryInstruction, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"
                                FontSize="12" TextWrapping="Wrap"
@@ -844,17 +896,26 @@
                         <DataTemplate x:DataType="models:AIContextMessage">
                           <Border Background="{DynamicResource PanelElevatedBrush}"
                                   CornerRadius="8" Padding="10" Margin="0,0,0,6">
-                            <StackPanel Spacing="4">
-                              <StackPanel Orientation="Horizontal" Spacing="6">
-                                <TextBlock Text="{Binding Role}" FontSize="10"
-                                           Foreground="{DynamicResource AccentBrush}" />
-                                <TextBlock Text="{Binding Source}" FontSize="10"
-                                           Foreground="{DynamicResource TextMutedBrush}" />
-                                <TextBlock Text="📌" FontSize="10" IsVisible="{Binding IsPinned}" />
+                            <Grid ColumnDefinitions="Auto,*" ColumnSpacing="8">
+                              <CheckBox VerticalAlignment="Top"
+                                        IsChecked="{Binding IsIncludedInRequest, Mode=OneWay}"
+                                        Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).AiPanel.ToggleExcludeCommand}"
+                                        CommandParameter="{Binding MessageId}" />
+                              <StackPanel Grid.Column="1" Spacing="4">
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                  <TextBlock Text="{Binding Role}" FontSize="10"
+                                             Foreground="{DynamicResource AccentBrush}" />
+                                  <TextBlock Text="{Binding Source}" FontSize="10"
+                                             Foreground="{DynamicResource TextMutedBrush}" />
+                                  <TextBlock Text="📌" FontSize="10" IsVisible="{Binding IsPinned}" />
+                                  <TextBlock Text="{Binding Timestamp, StringFormat={}{0:HH:mm}}" FontSize="10"
+                                             Foreground="{DynamicResource TextMutedBrush}" />
+                                </StackPanel>
+                                <TextBlock Text="{Binding Content}" TextWrapping="Wrap" FontSize="12"
+                                           MaxHeight="72" TextTrimming="CharacterEllipsis"
+                                           Foreground="{DynamicResource TextBrush}" />
                               </StackPanel>
-                              <TextBlock Text="{Binding Content}" TextWrapping="Wrap" FontSize="12"
-                                         Foreground="{DynamicResource TextBrush}" />
-                            </StackPanel>
+                            </Grid>
                           </Border>
                         </DataTemplate>
                       </ItemsControl.ItemTemplate>
@@ -863,10 +924,10 @@
                 </ScrollViewer>
                 <TextBlock Grid.Row="2" FontSize="11"
                            Foreground="{DynamicResource TextMutedBrush}"
-                           Text="预览与真实 API payload 一致" />
+                           Text="预览与真实 API payload 同源（临时排除仅本次）" />
               </Grid>
             </Border>
-          </Border>
+          </Grid>
         </Grid>
 
         <!-- Toast banner -->
@@ -933,10 +994,102 @@
                           Command="{Binding SetThemeCommand}"
                           CommandParameter="System"
                           Content="○ 跟随系统" />
+
+                  <Border Height="1" Background="{DynamicResource DividerBrush}" Margin="0,8" />
+
+                  <TextBlock Text="AI 服务"
+                             FontWeight="SemiBold"
+                             Foreground="{DynamicResource TextBrush}" />
+                  <TextBlock Text="提供商"
+                             FontSize="12"
+                             Foreground="{DynamicResource TextSecondaryBrush}" />
+                  <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Button Classes="segment"
+                            Classes.active="{Binding IsProviderMock}"
+                            Command="{Binding SetAiProviderCommand}"
+                            CommandParameter="Mock"
+                            Content="Mock" />
+                    <Button Classes="segment"
+                            Classes.active="{Binding IsProviderDeepSeek}"
+                            Command="{Binding SetAiProviderCommand}"
+                            CommandParameter="DeepSeek"
+                            Content="DeepSeek" />
+                  </StackPanel>
+
+                  <TextBlock Text="模型"
+                             FontSize="12"
+                             Foreground="{DynamicResource TextSecondaryBrush}" />
+                  <ComboBox ItemsSource="{Binding AvailableAiModels}"
+                            SelectedValue="{Binding SettingsAiModelId}"
+                            SelectedValueBinding="{Binding Id}"
+                            HorizontalAlignment="Stretch">
+                    <ComboBox.ItemTemplate>
+                      <DataTemplate x:DataType="models:AIModelDescriptor">
+                        <TextBlock Text="{Binding DisplayName}" />
+                      </DataTemplate>
+                    </ComboBox.ItemTemplate>
+                  </ComboBox>
+
+                  <TextBlock Text="API Key"
+                             FontSize="12"
+                             Foreground="{DynamicResource TextSecondaryBrush}" />
+                  <Grid ColumnDefinitions="*,Auto">
+                    <Panel>
+                      <TextBox Text="{Binding SettingsApiKey}"
+                               PasswordChar="*"
+                               PlaceholderText="sk-..."
+                               IsVisible="{Binding !SettingsShowApiKey}" />
+                      <TextBox Text="{Binding SettingsApiKey}"
+                               PlaceholderText="sk-..."
+                               IsVisible="{Binding SettingsShowApiKey}" />
+                    </Panel>
+                    <Button Grid.Column="1"
+                            Classes="glass-button"
+                            Margin="8,0,0,0"
+                            Content="显示"
+                            Command="{Binding ToggleShowApiKeyCommand}" />
+                  </Grid>
+
+                  <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Button Classes="glass-button"
+                            Content="测试连接"
+                            Command="{Binding TestAiConnectionCommand}"
+                            IsEnabled="{Binding !IsTestingConnection}" />
+                    <Button Classes="glass-button"
+                            Content="保存"
+                            Command="{Binding SaveAiProviderSettingsCommand}" />
+                    <Button Classes="glass-button"
+                            Content="清除 Key"
+                            Command="{Binding ClearApiKeyCommand}" />
+                  </StackPanel>
+                  <TextBlock Text="{Binding SettingsConnectionMessage}"
+                             FontSize="11"
+                             TextWrapping="Wrap"
+                             Foreground="{DynamicResource TextMutedBrush}" />
+
+                  <Button Classes="glass-button"
+                          HorizontalAlignment="Left"
+                          Content="高级选项 ▾"
+                          Command="{Binding ToggleAiAdvancedCommand}" />
+                  <StackPanel Spacing="8" IsVisible="{Binding IsAiAdvancedExpanded}">
+                    <TextBlock Text="Base URL" FontSize="12"
+                               Foreground="{DynamicResource TextSecondaryBrush}" />
+                    <TextBox Text="{Binding SettingsBaseUrl}" />
+                    <TextBlock Text="超时（秒）" FontSize="12"
+                               Foreground="{DynamicResource TextSecondaryBrush}" />
+                    <NumericUpDown Value="{Binding SettingsTimeoutSeconds}" Minimum="5" Maximum="300" />
+                    <TextBlock Text="Max Tokens" FontSize="12"
+                               Foreground="{DynamicResource TextSecondaryBrush}" />
+                    <NumericUpDown Value="{Binding SettingsMaxTokens}" Minimum="16" Maximum="8192" />
+                    <TextBlock Text="Temperature" FontSize="12"
+                               Foreground="{DynamicResource TextSecondaryBrush}" />
+                    <NumericUpDown Value="{Binding SettingsTemperature}" Minimum="0" Maximum="2" Increment="0.1" FormatString="0.0" />
+                    <CheckBox IsChecked="{Binding SettingsStreaming}" Content="启用流式输出" />
+                  </StackPanel>
                 </StackPanel>
               </ScrollViewer>
               <TextBlock Grid.Row="2"
-                         Text="WechatAIClient · Phase 1 Mock"
+                         Text="WechatAIClient · Round 3 DeepSeek"
                          Foreground="{DynamicResource TextMutedBrush}"
                          FontSize="11"
                          HorizontalAlignment="Center" />

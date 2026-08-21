@@ -92,6 +92,7 @@ internal sealed class FakeSettings : ISettingsStore
 internal sealed class FakeAISettings : IAISettingsService
 {
     private AIGlobalSettings _global = new();
+    private AIProviderSettings _provider = new();
     private readonly Dictionary<string, AIContactOverride> _overrides = new(StringComparer.Ordinal);
     private readonly Dictionary<string, List<string>> _pins = new(StringComparer.Ordinal);
     private DateTime? _pausedUntil;
@@ -171,15 +172,30 @@ internal sealed class FakeAISettings : IAISettingsService
         _pausedUntil = until;
         return Task.CompletedTask;
     }
+
+    public Task<AIProviderSettings> GetProviderSettingsAsync(CancellationToken cancellationToken = default)
+        => Task.FromResult(_provider);
+
+    public Task SaveProviderSettingsAsync(AIProviderSettings settings, CancellationToken cancellationToken = default)
+    {
+        _provider = settings;
+        return Task.CompletedTask;
+    }
 }
 
 internal sealed class ControllableAI : IAIService
 {
+    private int _activeCount;
+
     public string ModelName => "TestAI";
     public bool IsConnected { get; private set; } = true;
+    public AIProviderKind ProviderKind => AIProviderKind.Mock;
     public TimeSpan Delay { get; set; } = TimeSpan.FromMilliseconds(200);
     public string Reply { get; set; } = "AI回复内容";
     public int CallCount { get; private set; }
+    public int CancelledCount { get; private set; }
+    public int MaxObservedActive { get; private set; }
+    public TaskCompletionSource? HoldGate { get; set; }
     public IReadOnlyList<AIContextMessage>? LastMessages { get; private set; }
 
     public Task ConnectAsync(CancellationToken cancellationToken = default)
@@ -192,12 +208,53 @@ internal sealed class ControllableAI : IAIService
     {
         CallCount++;
         LastMessages = request.Messages.ToList();
-        await Task.Delay(Delay, cancellationToken);
+        await WaitAsync(cancellationToken);
         return new AIResponse
         {
             Content = Reply,
             GenerationId = request.GenerationId,
-            ContactId = request.ContactId
+            ContactId = request.ContactId,
+            Status = AIGenerationStatus.Completed
         };
+    }
+
+    public async IAsyncEnumerable<AIStreamEvent> GenerateStreamAsync(
+        AIRequest request,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        CallCount++;
+        LastMessages = request.Messages.ToList();
+        await WaitAsync(cancellationToken);
+        yield return new AIStreamEvent(Reply, IsDone: false);
+        yield return new AIStreamEvent(null, IsDone: true);
+    }
+
+    public Task<AIConnectionTestResult> TestConnectionAsync(CancellationToken cancellationToken = default)
+        => Task.FromResult(new AIConnectionTestResult(true, "ok", 1, AIErrorKind.None));
+
+    private async Task WaitAsync(CancellationToken cancellationToken)
+    {
+        var active = Interlocked.Increment(ref _activeCount);
+        MaxObservedActive = Math.Max(MaxObservedActive, active);
+        try
+        {
+            if (HoldGate is not null)
+            {
+                await HoldGate.Task.WaitAsync(cancellationToken);
+            }
+            else
+            {
+                await Task.Delay(Delay, cancellationToken);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            CancelledCount++;
+            throw;
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _activeCount);
+        }
     }
 }

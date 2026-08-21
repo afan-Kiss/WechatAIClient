@@ -110,6 +110,7 @@ public partial class ChatViewModel : ViewModelBase
             Messages.Clear();
             foreach (var message in messages)
             {
+                message.IsPinned = _pinnedIds.Contains(message.Id);
                 Messages.Add(message);
             }
 
@@ -167,9 +168,18 @@ public partial class ChatViewModel : ViewModelBase
             return;
         }
 
+        var wasPinned = IsPinned(message.Id);
         var pinned = await _aiSettings.TogglePinAsync(CurrentContact.Id, message.Id);
         await RefreshPinsAsync(CurrentContact.Id);
-        await _toast.ShowAsync(pinned ? "已置顶" : "已取消置顶");
+        if (!wasPinned && !pinned)
+        {
+            await _toast.ShowAsync("最多置顶 20 条");
+        }
+        else
+        {
+            await _toast.ShowAsync(pinned ? "已置顶" : "已取消置顶");
+        }
+
         OnPropertyChanged(nameof(Messages));
     }
 
@@ -390,6 +400,13 @@ public partial class ChatViewModel : ViewModelBase
         {
             var pins = await _aiSettings.GetPinnedIdsAsync(contactId);
             _pinnedIds = new HashSet<string>(pins, StringComparer.Ordinal);
+            foreach (var message in Messages)
+            {
+                message.IsPinned = _pinnedIds.Contains(message.Id);
+            }
+
+            // Force item rebind for IsPinned visibility
+            OnPropertyChanged(nameof(Messages));
         }
         catch (Exception ex)
         {

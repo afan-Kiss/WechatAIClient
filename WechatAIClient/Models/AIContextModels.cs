@@ -25,6 +25,9 @@ public sealed class AIContextMessage
     public string ContactId { get; set; } = "";
     public bool IsPinned { get; set; }
     public DateTime Timestamp { get; set; }
+    /// <summary>UI: whether this history line is included in the current request (not system).</summary>
+    public bool IsIncludedInRequest { get; set; } = true;
+    public bool IsSystemRole => string.Equals(Role, "system", StringComparison.OrdinalIgnoreCase);
 }
 
 public sealed class AIContextBuildResult
@@ -54,6 +57,7 @@ public sealed class AIRequest
     public ReplyLength Length { get; set; } = ReplyLength.Medium;
     public string? TemporaryInstruction { get; set; }
     public AIContextBuildResult ContextMeta { get; set; } = new();
+    public Action<AIStreamEvent>? OnStreamEvent { get; set; }
 }
 
 public sealed class AIResponse
@@ -61,4 +65,22 @@ public sealed class AIResponse
     public string Content { get; set; } = "";
     public string GenerationId { get; set; } = "";
     public string ContactId { get; set; } = "";
+    public string? RequestId { get; set; }
+    public string? Model { get; set; }
+    public TimeSpan Duration { get; set; }
+    public AIUsage? Usage { get; set; }
+    public AIGenerationStatus Status { get; set; } = AIGenerationStatus.Completed;
+    public AIErrorKind ErrorKind { get; set; } = AIErrorKind.None;
 }
+
+public sealed record AIStreamEvent(
+    string? DeltaContent,
+    bool IsDone,
+    AIUsage? Usage = null,
+    string? RequestId = null);
+
+public sealed record AIConnectionTestResult(
+    bool Success,
+    string Message,
+    int LatencyMs,
+    AIErrorKind ErrorKind);

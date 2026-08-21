@@ -1,7 +1,9 @@
 namespace WechatAIClient.Models;
 
-public sealed class ChatMessage
+public sealed class ChatMessage : System.ComponentModel.INotifyPropertyChanged
 {
+    private bool _isPinned;
+
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
     public string ContactId { get; set; } = string.Empty;
     public string SenderName { get; set; } = string.Empty;
@@ -22,4 +24,22 @@ public sealed class ChatMessage
     public string? TimeSeparatorText { get; set; }
     public bool MentionsMe { get; set; }
     public bool QuotesMe { get; set; }
+
+    /// <summary>UI-only flag; refreshed from pin list when messages load.</summary>
+    public bool IsPinned
+    {
+        get => _isPinned;
+        set
+        {
+            if (_isPinned == value)
+            {
+                return;
+            }
+
+            _isPinned = value;
+            PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(nameof(IsPinned)));
+        }
+    }
+
+    public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
 }

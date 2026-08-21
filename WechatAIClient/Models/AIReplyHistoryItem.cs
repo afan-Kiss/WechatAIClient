@@ -8,4 +8,7 @@ public sealed class AIReplyHistoryItem
     public string Content { get; set; } = string.Empty;
     public string ContactName { get; set; } = string.Empty;
     public string ContactId { get; set; } = string.Empty;
+    public string? Model { get; set; }
+    public string? RequestId { get; set; }
+    public string? ContextSummary { get; set; }
 }

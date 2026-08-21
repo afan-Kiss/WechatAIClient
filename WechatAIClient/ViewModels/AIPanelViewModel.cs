@@ -5,6 +5,7 @@ using CommunityToolkit.Mvvm.Input;
 using Microsoft.Extensions.Logging;
 using WechatAIClient.Models;
 using WechatAIClient.Services;
+using WechatAIClient.Services.DeepSeek;
 
 namespace WechatAIClient.ViewModels;
 
@@ -14,6 +15,7 @@ public partial class AIPanelViewModel : ViewModelBase
     private readonly AIOrchestrator _orchestrator;
     private readonly IAIContextBuilder _contextBuilder;
     private readonly IAISettingsService _aiSettings;
+    private readonly ISecretStore _secrets;
     private readonly IClipboardService _clipboard;
     private readonly IToastService _toast;
     private readonly SqliteStore _sqlite;
@@ -21,12 +23,18 @@ public partial class AIPanelViewModel : ViewModelBase
     private string? _boundContactId;
     private bool _suppressPersist;
     private AIContextBuildResult? _lastBuildResult;
+    private IReadOnlyList<ChatMessage> _lastPreviewSource = Array.Empty<ChatMessage>();
+    private string _lastPreviewContactId = "";
+    private string _lastPreviewContactName = "";
+    private bool _lastPreviewIsGroup;
+    private EventHandler? _statusHandler;
 
     public AIPanelViewModel(
         IAIService aiService,
         AIOrchestrator orchestrator,
         IAIContextBuilder contextBuilder,
         IAISettingsService aiSettings,
+        ISecretStore secrets,
         IClipboardService clipboard,
         IToastService toast,
         SqliteStore sqlite,
@@ -36,15 +44,20 @@ public partial class AIPanelViewModel : ViewModelBase
         _orchestrator = orchestrator;
         _contextBuilder = contextBuilder;
         _aiSettings = aiSettings;
+        _secrets = secrets;
         _clipboard = clipboard;
         _toast = toast;
         _sqlite = sqlite;
         _logger = logger;
         ModelName = aiService.ModelName;
+
+        _statusHandler = (_, _) => Dispatcher.UIThread.Post(SyncGenerationStatus);
+        _orchestrator.StatusChanged += _statusHandler;
     }
 
     public ObservableCollection<AIReplyHistoryItem> ReplyHistory { get; } = [];
     public ObservableCollection<AIContextMessage> PreviewMessages { get; } = [];
+    public ObservableCollection<string> TemporarilyExcludedMessageIds { get; } = [];
 
     public AIContextBuildResult? LastBuildResult
     {
@@ -54,15 +67,23 @@ public partial class AIPanelViewModel : ViewModelBase
             if (SetProperty(ref _lastBuildResult, value))
             {
                 ContextSummaryText = value?.SummaryText ?? string.Empty;
+                TokenEstimateText = value is null
+                    ? string.Empty
+                    : value.EstimatedTokens >= 1000
+                        ? $"约 {value.EstimatedTokens / 1000.0:0.0}K tokens"
+                        : $"约 {value.EstimatedTokens} tokens";
             }
         }
     }
 
     [ObservableProperty]
-    private string _modelName = "DeepSeek-V3";
+    private string _modelName = "Mock-AI";
 
     [ObservableProperty]
-    private bool _isConnected;
+    [NotifyPropertyChangedFor(nameof(IsConnected))]
+    private AIConnectionState _connectionState = AIConnectionState.NotConfigured;
+
+    public bool IsConnected => ConnectionState == AIConnectionState.Connected;
 
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(IsAutoMode))]
@@ -136,6 +157,9 @@ public partial class AIPanelViewModel : ViewModelBase
     private string _contextSummaryText = string.Empty;
 
     [ObservableProperty]
+    private string _tokenEstimateText = string.Empty;
+
+    [ObservableProperty]
     private string _pinnedCountText = "置顶 0";
 
     [ObservableProperty]
@@ -151,7 +175,19 @@ public partial class AIPanelViewModel : ViewModelBase
     private bool _isGenerating;
 
     [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsStreaming))]
+    private AIGenerationStatus _generationStatus = AIGenerationStatus.Idle;
+
+    [ObservableProperty]
+    private string _statusText = string.Empty;
+
+    public bool IsStreaming => GenerationStatus == AIGenerationStatus.Streaming;
+
+    [ObservableProperty]
     private string _typingPreview = string.Empty;
+
+    [ObservableProperty]
+    private string _streamingPreview = string.Empty;
 
     [ObservableProperty]
     private string? _latestGeneratedReply;
@@ -162,11 +198,14 @@ public partial class AIPanelViewModel : ViewModelBase
 
     public bool IsAutoPaused => AutoPausedUntil is { } until && until > DateTime.Now;
 
+    public string? ActiveGenerationContactId => _orchestrator.ActiveContactId;
+
     public async Task InitializeAsync()
     {
         await BindContactAsync(null);
-        await _aiService.ConnectAsync();
-        IsConnected = _aiService.IsConnected;
+        await RefreshConnectionStateAsync();
+        // Do not block startup with a live connection probe.
+        ModelName = _aiService.ModelName;
 
         var history = await _sqlite.GetHistoryAsync(200);
         ReplyHistory.Clear();
@@ -181,6 +220,7 @@ public partial class AIPanelViewModel : ViewModelBase
     public async Task BindContactAsync(string? contactId)
     {
         _boundContactId = string.IsNullOrWhiteSpace(contactId) ? null : contactId;
+        TemporarilyExcludedMessageIds.Clear();
         _suppressPersist = true;
         try
         {
@@ -233,8 +273,15 @@ public partial class AIPanelViewModel : ViewModelBase
         string contactName,
         bool isGroup)
     {
+        _lastPreviewSource = messages.ToList();
+        _lastPreviewContactId = contactId;
+        _lastPreviewContactName = contactName;
+        _lastPreviewIsGroup = isGroup;
+
         var pins = await _aiSettings.GetPinnedIdsAsync(contactId);
-        var input = new AIContextBuildInput
+        var excluded = new HashSet<string>(TemporarilyExcludedMessageIds, StringComparer.Ordinal);
+
+        AIContextBuildInput MakeInput(HashSet<string>? tempExclude) => new()
         {
             ContactId = contactId,
             ContactName = contactName,
@@ -245,14 +292,40 @@ public partial class AIPanelViewModel : ViewModelBase
             PinnedMessageIds = pins,
             TemporaryInstruction = string.IsNullOrWhiteSpace(TemporaryInstruction) ? null : TemporaryInstruction,
             ReplyStyle = ReplyStyle,
-            ReplyLength = ReplyLength
+            ReplyLength = ReplyLength,
+            TemporarilyExcludedMessageIds = tempExclude is { Count: > 0 } ? tempExclude : null
         };
-        var result = _contextBuilder.Build(input);
-        LastBuildResult = result;
+
+        // Final payload / summary always use exclusions (same builder as AIRequest).
+        var finalResult = _contextBuilder.Build(MakeInput(excluded));
+        LastBuildResult = finalResult;
+
+        // Preview list: candidates without temp-exclude so unchecked rows stay visible.
+        var displayResult = excluded.Count == 0
+            ? finalResult
+            : _contextBuilder.Build(MakeInput(null));
+
         PreviewMessages.Clear();
-        foreach (var msg in result.Messages)
+        foreach (var msg in displayResult.Messages)
         {
+            if (msg.IsSystemRole)
+            {
+                continue;
+            }
+
+            msg.IsIncludedInRequest = !excluded.Contains(msg.MessageId);
             PreviewMessages.Add(msg);
+        }
+
+        OnPropertyChanged(nameof(ContextSummaryText));
+        OnPropertyChanged(nameof(TokenEstimateText));
+        // LastBuildResult setter already updates summary/token; ensure UI refresh if same reference path
+        if (LastBuildResult is not null)
+        {
+            ContextSummaryText = LastBuildResult.SummaryText;
+            TokenEstimateText = LastBuildResult.EstimatedTokens >= 1000
+                ? $"约 {LastBuildResult.EstimatedTokens / 1000.0:0.0}K tokens"
+                : $"约 {LastBuildResult.EstimatedTokens} tokens";
         }
     }
 
@@ -262,15 +335,24 @@ public partial class AIPanelViewModel : ViewModelBase
         try
         {
             await _aiService.ConnectAsync();
-            IsConnected = _aiService.IsConnected;
+            await RefreshConnectionStateAsync(connectedHint: _aiService.IsConnected);
+            ModelName = _aiService.ModelName;
             if (IsConnected)
             {
                 await _toast.ShowAsync("AI 已连接");
             }
         }
+        catch (AIServiceException ex)
+        {
+            ConnectionState = AIConnectionState.Failed;
+            OnPropertyChanged(nameof(IsConnected));
+            await _toast.ShowAsync(ex.UserMessage);
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "AI connect failed");
+            ConnectionState = AIConnectionState.Failed;
+            OnPropertyChanged(nameof(IsConnected));
             await _toast.ShowAsync("连接失败");
         }
     }
@@ -326,6 +408,54 @@ public partial class AIPanelViewModel : ViewModelBase
     private void ToggleMoreSettings() => IsMoreSettingsExpanded = !IsMoreSettingsExpanded;
 
     [RelayCommand]
+    private void ToggleExclude(string? messageId)
+    {
+        if (string.IsNullOrWhiteSpace(messageId))
+        {
+            return;
+        }
+
+        var existing = TemporarilyExcludedMessageIds.FirstOrDefault(id =>
+            string.Equals(id, messageId, StringComparison.Ordinal));
+        if (existing is not null)
+        {
+            TemporarilyExcludedMessageIds.Remove(existing);
+        }
+        else
+        {
+            TemporarilyExcludedMessageIds.Add(messageId);
+        }
+
+        _ = RefreshPreviewFromCacheAsync();
+    }
+
+    [RelayCommand]
+    private void ApplyInstructionChip(string? chip)
+    {
+        if (string.IsNullOrWhiteSpace(chip))
+        {
+            return;
+        }
+
+        TemporaryInstruction = chip.Trim();
+    }
+
+    [RelayCommand]
+    private void SelectAllPreview()
+    {
+        // 全选 = 全部纳入本次请求（清空临时排除）
+        TemporarilyExcludedMessageIds.Clear();
+        _ = RefreshPreviewFromCacheAsync();
+    }
+
+    [RelayCommand]
+    private void ResetPreviewExclusions()
+    {
+        TemporarilyExcludedMessageIds.Clear();
+        _ = RefreshPreviewFromCacheAsync();
+    }
+
+    [RelayCommand]
     private async Task CopyReplyAsync(AIReplyHistoryItem? item)
     {
         if (item is null)
@@ -363,16 +493,7 @@ public partial class AIPanelViewModel : ViewModelBase
     [RelayCommand]
     private async Task ToggleContextPreviewAsync()
     {
-        if (!IsContextPreviewOpen)
-        {
-            // Opening: caller should have refreshed; still flip open.
-            IsContextPreviewOpen = true;
-        }
-        else
-        {
-            IsContextPreviewOpen = false;
-        }
-
+        IsContextPreviewOpen = !IsContextPreviewOpen;
         await Task.CompletedTask;
     }
 
@@ -418,6 +539,9 @@ public partial class AIPanelViewModel : ViewModelBase
         _orchestrator.CancelCurrentGeneration();
         IsGenerating = false;
         TypingPreview = string.Empty;
+        StreamingPreview = string.Empty;
+        GenerationStatus = AIGenerationStatus.Cancelled;
+        StatusText = "已取消";
     }
 
     [RelayCommand]
@@ -448,8 +572,6 @@ public partial class AIPanelViewModel : ViewModelBase
             return;
         }
 
-        // Fresh: keep contact/settings but new GenerationId; caller should refresh snapshot.
-        // If snapshot already on last request, still regenerate with current panel settings.
         var request = CloneRequest(last);
         request.ContextLength = ContextLength;
         request.IncludeOwnMessages = IncludeOwnMessages;
@@ -490,7 +612,19 @@ public partial class AIPanelViewModel : ViewModelBase
             return null;
         }
 
-        // Fill from panel effective settings when not already set by caller
+        var provider = await _aiSettings.GetProviderSettingsAsync();
+        if (provider.Provider == AIProviderKind.DeepSeek)
+        {
+            var key = await _secrets.GetSecretAsync(DeepSeekAIService.ApiKeySecretName);
+            if (string.IsNullOrWhiteSpace(key))
+            {
+                await _toast.ShowAsync("请先配置 API Key");
+                ConnectionState = AIConnectionState.NotConfigured;
+                OnPropertyChanged(nameof(IsConnected));
+                return null;
+            }
+        }
+
         request.ContextLength = request.ContextLength > 0 ? request.ContextLength : ContextLength;
         request.ReplyMode = ReplyMode;
         request.IncludeOwnMessages = IncludeOwnMessages;
@@ -507,14 +641,22 @@ public partial class AIPanelViewModel : ViewModelBase
             request.PinnedMessageIds = await _aiSettings.GetPinnedIdsAsync(request.ContactId);
         }
 
+        if (TemporarilyExcludedMessageIds.Count > 0)
+        {
+            request.TemporarilyExcludedMessageIds = new HashSet<string>(TemporarilyExcludedMessageIds, StringComparer.Ordinal);
+        }
+
         var hadTempInstruction = !string.IsNullOrWhiteSpace(request.TemporaryInstruction);
 
         try
         {
             IsGenerating = true;
             TypingPreview = string.Empty;
+            StreamingPreview = string.Empty;
+            GenerationStatus = AIGenerationStatus.PreparingContext;
+            StatusText = "准备上下文…";
 
-            // Preview / summary before generate
+            var excluded = request.TemporarilyExcludedMessageIds;
             var preview = _contextBuilder.Build(new AIContextBuildInput
             {
                 ContactId = request.ContactId,
@@ -528,7 +670,7 @@ public partial class AIPanelViewModel : ViewModelBase
                 ReplyStyle = request.ReplyStyle,
                 ReplyLength = request.ReplyLength,
                 TokenBudget = request.TokenBudget > 0 ? request.TokenBudget : 3500,
-                TemporarilyExcludedMessageIds = request.TemporarilyExcludedMessageIds
+                TemporarilyExcludedMessageIds = excluded
             });
             LastBuildResult = preview;
             ContextSummaryText = preview.SummaryText;
@@ -540,10 +682,28 @@ public partial class AIPanelViewModel : ViewModelBase
 
             var result = await _orchestrator.GenerateAsync(
                 request,
-                chunk => Dispatcher.UIThread.Post(() => TypingPreview = chunk));
+                chunk => Dispatcher.UIThread.Post(() =>
+                {
+                    if (_orchestrator.ActiveContactId is not null &&
+                        !string.Equals(_orchestrator.ActiveContactId, request.ContactId, StringComparison.Ordinal))
+                    {
+                        return;
+                    }
 
-            if (result is null)
+                    TypingPreview = chunk;
+                    StreamingPreview = chunk;
+                    GenerationStatus = AIGenerationStatus.Streaming;
+                    StatusText = "生成中…";
+                }));
+
+            if (result is null || result.Status != AIGenerationStatus.Completed)
             {
+                if (GenerationStatus != AIGenerationStatus.Cancelled)
+                {
+                    GenerationStatus = AIGenerationStatus.Cancelled;
+                    StatusText = "已取消";
+                }
+
                 return null;
             }
 
@@ -552,13 +712,20 @@ public partial class AIPanelViewModel : ViewModelBase
                 LastBuildResult = _orchestrator.LastBuildResult;
             }
 
+            GenerationStatus = AIGenerationStatus.Completed;
+            StatusText = "已完成";
+            ModelName = _aiService.ModelName;
+
             var history = new AIReplyHistoryItem
             {
                 Timestamp = DateTime.Now,
                 Status = ReplyMode == AIReplyMode.Auto ? "自动回复" : "手动确认",
                 Content = result.Content,
                 ContactName = request.ContactName,
-                ContactId = request.ContactId
+                ContactId = request.ContactId,
+                Model = result.Model ?? _aiService.ModelName,
+                RequestId = result.RequestId,
+                ContextSummary = result.ContextSummary
             };
 
             ReplyHistory.Insert(0, history);
@@ -577,11 +744,19 @@ public partial class AIPanelViewModel : ViewModelBase
 
             return result;
         }
+        catch (AIServiceException ex)
+        {
+            GenerationStatus = AIGenerationStatus.Failed;
+            StatusText = ex.UserMessage;
+            await _toast.ShowAsync(ex.UserMessage);
+            return null;
+        }
         catch (Exception ex)
         {
+            GenerationStatus = AIGenerationStatus.Failed;
+            StatusText = "生成失败";
             _logger.LogError(ex, "AI generate failed");
             await _toast.ShowAsync("生成失败");
-            // keep TemporaryInstruction on failure
             return null;
         }
         finally
@@ -596,6 +771,46 @@ public partial class AIPanelViewModel : ViewModelBase
         return result?.Content;
     }
 
+    public async Task RefreshConnectionStateAsync(bool? connectedHint = null)
+    {
+        try
+        {
+            var provider = await _aiSettings.GetProviderSettingsAsync();
+            if (provider.Provider == AIProviderKind.Mock)
+            {
+                ConnectionState = connectedHint == true || _aiService.IsConnected
+                    ? AIConnectionState.Connected
+                    : AIConnectionState.Configured;
+                OnPropertyChanged(nameof(IsConnected));
+                return;
+            }
+
+            var key = await _secrets.GetSecretAsync(DeepSeekAIService.ApiKeySecretName);
+            if (string.IsNullOrWhiteSpace(key))
+            {
+                ConnectionState = AIConnectionState.NotConfigured;
+            }
+            else if (connectedHint == true || (_aiService.IsConnected && _aiService.ProviderKind == AIProviderKind.DeepSeek))
+            {
+                ConnectionState = AIConnectionState.Connected;
+            }
+            else if (connectedHint == false)
+            {
+                ConnectionState = AIConnectionState.Failed;
+            }
+            else
+            {
+                ConnectionState = AIConnectionState.Configured;
+            }
+
+            OnPropertyChanged(nameof(IsConnected));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "RefreshConnectionState failed");
+        }
+    }
+
     partial void OnReplyModeChanged(AIReplyMode value) => _ = PersistSettingsAsync();
     partial void OnContextLengthChanged(int value)
     {
@@ -607,6 +822,38 @@ public partial class AIPanelViewModel : ViewModelBase
     partial void OnReplyStyleChanged(ReplyStyle value) => _ = PersistSettingsAsync();
     partial void OnReplyLengthChanged(ReplyLength value) => _ = PersistSettingsAsync();
     partial void OnGroupTriggerModeChanged(GroupTriggerMode value) => _ = PersistSettingsAsync();
+
+    private void SyncGenerationStatus()
+    {
+        GenerationStatus = _orchestrator.Status;
+        StatusText = _orchestrator.Status switch
+        {
+            AIGenerationStatus.PreparingContext => "准备上下文…",
+            AIGenerationStatus.Connecting => "连接中…",
+            AIGenerationStatus.Streaming => "生成中…",
+            AIGenerationStatus.Completed => "已完成",
+            AIGenerationStatus.Cancelled => "已取消",
+            AIGenerationStatus.Failed => "失败",
+            _ => string.Empty
+        };
+        IsGenerating = _orchestrator.Status is AIGenerationStatus.PreparingContext
+            or AIGenerationStatus.Connecting
+            or AIGenerationStatus.Streaming;
+    }
+
+    private async Task RefreshPreviewFromCacheAsync()
+    {
+        if (_lastPreviewSource.Count == 0 || string.IsNullOrWhiteSpace(_lastPreviewContactId))
+        {
+            return;
+        }
+
+        await RefreshContextPreviewAsync(
+            _lastPreviewSource,
+            _lastPreviewContactId,
+            _lastPreviewContactName,
+            _lastPreviewIsGroup);
+    }
 
     private void ApplyEffective(EffectiveAISettings effective)
     {

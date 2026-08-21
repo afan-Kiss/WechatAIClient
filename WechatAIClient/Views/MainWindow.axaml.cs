@@ -223,9 +223,30 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (DataContext is MainWindowViewModel vm && vm.IsSettingsOpen)
+        if (DataContext is not MainWindowViewModel vm)
+        {
+            return;
+        }
+
+        if (vm.AiPanel.IsContextPreviewOpen)
+        {
+            vm.AiPanel.ToggleContextPreviewCommand.Execute(null);
+            e.Handled = true;
+            return;
+        }
+
+        if (vm.IsSettingsOpen)
         {
             vm.CloseSettingsCommand.Execute(null);
+            e.Handled = true;
+        }
+    }
+
+    private void ContextPreviewMask_OnPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (DataContext is MainWindowViewModel vm && vm.AiPanel.IsContextPreviewOpen)
+        {
+            vm.AiPanel.ToggleContextPreviewCommand.Execute(null);
             e.Handled = true;
         }
     }
@@ -235,6 +256,15 @@ public partial class MainWindow : Window
         if (DataContext is MainWindowViewModel vm)
         {
             vm.CloseSettingsCommand.Execute(null);
+            e.Handled = true;
+        }
+    }
+
+    private void AiInstruction_OnKeyDown(object? sender, KeyEventArgs e)
+    {
+        // Prevent Enter in AI instruction box from bubbling to chat send.
+        if (e.Key == Key.Enter && !e.KeyModifiers.HasFlag(KeyModifiers.Shift))
+        {
             e.Handled = true;
         }
     }
