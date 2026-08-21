@@ -38,7 +38,15 @@ public sealed class MultiAccountWechatService : IWechatService, IAsyncDisposable
     public WechatConnectionState GetAccountConnectionState(string accountId)
         => _manager.GetAccountConnectionState(accountId);
 
-    public bool CanSend(ConversationKey key)
+    public bool CanSend(ConversationKey key) => CanManualSend(key);
+
+    public bool CanManualSend(ConversationKey key)
+    {
+        var state = GetAccountConnectionState(key.AccountId);
+        return state is WechatConnectionState.Connected or WechatConnectionState.Degraded;
+    }
+
+    public bool CanAutoReply(ConversationKey key)
     {
         var state = GetAccountConnectionState(key.AccountId);
         return state == WechatConnectionState.Connected;
@@ -77,13 +85,12 @@ public sealed class MultiAccountWechatService : IWechatService, IAsyncDisposable
     {
         await EnsureStartedAsync(cancellationToken);
         var selected = SelectedAccountId;
-        WechatAccountSession? session = null;
-        if (!string.IsNullOrWhiteSpace(selected))
+        if (string.IsNullOrWhiteSpace(selected))
         {
-            session = _manager.GetSession(selected);
+            return null;
         }
 
-        session ??= _manager.Sessions.FirstOrDefault();
+        var session = _manager.GetSession(selected);
         if (session is null)
         {
             return null;
@@ -116,23 +123,23 @@ public sealed class MultiAccountWechatService : IWechatService, IAsyncDisposable
     public async Task<IReadOnlyList<Contact>> GetRecentChatsAsync(CancellationToken cancellationToken = default)
     {
         await EnsureStartedAsync(cancellationToken);
-        var sessions = ActiveSessions();
-        var all = new List<Contact>();
-        foreach (var session in sessions)
+        var sessions = ActiveSessions().ToList();
+        var tasks = sessions.Select(async session =>
         {
             try
             {
-                all.AddRange(await session.GetRecentAsync(cancellationToken));
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                timeout.CancelAfter(TimeSpan.FromSeconds(12));
+                return await session.GetRecentAsync(timeout.Token);
             }
             catch (Exception ex)
             {
                 _logger.LogDebug(ex, "GetRecent failed for {AccountId}", session.AccountId);
+                return (IReadOnlyList<Contact>)Array.Empty<Contact>();
             }
-        }
-
-        return all
-            .OrderByDescending(c => c.LastMessageTime)
-            .ToList();
+        });
+        var chunks = await Task.WhenAll(tasks);
+        return chunks.SelectMany(c => c).OrderByDescending(c => c.LastMessageTime).ToList();
     }
 
     public async Task<IReadOnlyList<ChatMessage>> GetMessagesAsync(
@@ -343,8 +350,7 @@ public sealed class MultiAccountWechatService : IWechatService, IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        _ = (key, content, mentionsMe, quotesMe);
-        return Task.CompletedTask;
+        throw new NotSupportedException("SimulateIncomingMessageAsync is only supported by MockWechatService.");
     }
 
     public Task SimulateIncomingMessageAsync(
@@ -355,8 +361,7 @@ public sealed class MultiAccountWechatService : IWechatService, IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        _ = (contactId, content, mentionsMe, quotesMe);
-        return Task.CompletedTask;
+        throw new NotSupportedException("SimulateIncomingMessageAsync is only supported by MockWechatService.");
     }
 
     public async ValueTask DisposeAsync()
@@ -375,22 +380,24 @@ public sealed class MultiAccountWechatService : IWechatService, IAsyncDisposable
         Func<WechatAccountSession, Task<IReadOnlyList<Contact>>> loader,
         ContactType expectedType)
     {
-        var sessions = ActiveSessions();
-        var all = new List<Contact>();
-        foreach (var session in sessions)
+        var sessions = ActiveSessions().ToList();
+        var tasks = sessions.Select(async session =>
         {
             try
             {
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(CancellationToken.None);
+                timeout.CancelAfter(TimeSpan.FromSeconds(12));
                 var list = await loader(session);
-                all.AddRange(list.Where(c => c.Type == expectedType || expectedType == c.Type));
+                return list.Where(c => c.Type == expectedType).ToList();
             }
             catch (Exception ex)
             {
                 _logger.LogDebug(ex, "Contact load failed for {AccountId}", session.AccountId);
+                return new List<Contact>();
             }
-        }
-
-        return all;
+        });
+        var chunks = await Task.WhenAll(tasks);
+        return chunks.SelectMany(c => c).ToList();
     }
 
     private IEnumerable<WechatAccountSession> ActiveSessions()

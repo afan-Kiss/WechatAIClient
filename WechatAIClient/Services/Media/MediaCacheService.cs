@@ -52,8 +52,9 @@ public sealed class MediaCacheService : IMediaCacheService
 
     private readonly ILogger<MediaCacheService> _logger;
     private readonly IHttpClientFactory _httpClientFactory;
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _gates = new(StringComparer.Ordinal);
+    private readonly KeyedSemaphoreGate _gates = new();
     private readonly ConcurrentDictionary<string, DateTime> _failUntil = new(StringComparer.Ordinal);
+    private readonly SemaphoreSlim _globalMediaLimit = new(4, 4);
     private readonly string _root;
 
     public MediaCacheService(ILogger<MediaCacheService> logger, IHttpClientFactory httpClientFactory)
@@ -169,8 +170,15 @@ public sealed class MediaCacheService : IMediaCacheService
         {
             try
             {
+                var localLen = new FileInfo(urlOrPath).Length;
+                if (localLen <= 0 || localLen > maxBytes)
+                {
+                    _failUntil[cacheKey] = DateTime.UtcNow.AddMinutes(15);
+                    return null;
+                }
+
                 File.Copy(urlOrPath, targetPath, overwrite: true);
-                if (LooksLikeImageFile(targetPath))
+                if (LooksLikeImageFile(targetPath) && new FileInfo(targetPath).Length <= maxBytes)
                 {
                     _failUntil.TryRemove(cacheKey, out _);
                     return targetPath;
@@ -184,8 +192,8 @@ public sealed class MediaCacheService : IMediaCacheService
             }
         }
 
-        var gate = _gates.GetOrAdd(cacheKey, _ => new SemaphoreSlim(1, 1));
-        await gate.WaitAsync(cancellationToken);
+        using var gate = await _gates.AcquireAsync(cacheKey, cancellationToken);
+        await _globalMediaLimit.WaitAsync(cancellationToken);
         try
         {
             if (File.Exists(targetPath) && new FileInfo(targetPath).Length > 0 && LooksLikeImageFile(targetPath))
@@ -199,12 +207,20 @@ public sealed class MediaCacheService : IMediaCacheService
                 var downloaded = await downloadFactory(targetPath, cancellationToken);
                 if (!string.IsNullOrWhiteSpace(downloaded) && File.Exists(downloaded))
                 {
+                    var len = new FileInfo(downloaded).Length;
+                    if (len <= 0 || len > maxBytes)
+                    {
+                        TryDelete(downloaded);
+                        _failUntil[cacheKey] = DateTime.UtcNow.AddMinutes(15);
+                        return null;
+                    }
+
                     if (!string.Equals(downloaded, targetPath, StringComparison.OrdinalIgnoreCase))
                     {
                         File.Copy(downloaded, targetPath, overwrite: true);
                     }
 
-                    if (LooksLikeImageFile(targetPath))
+                    if (LooksLikeImageFile(targetPath) && new FileInfo(targetPath).Length <= maxBytes)
                     {
                         _failUntil.TryRemove(cacheKey, out _);
                         return targetPath;
@@ -237,14 +253,7 @@ public sealed class MediaCacheService : IMediaCacheService
         }
         finally
         {
-            gate.Release();
-            if (_gates.TryGetValue(cacheKey, out var current) && ReferenceEquals(current, gate) && gate.CurrentCount == 1)
-            {
-                if (_gates.TryRemove(cacheKey, out var removed) && ReferenceEquals(removed, gate))
-                {
-                    gate.Dispose();
-                }
-            }
+            _globalMediaLimit.Release();
         }
     }
 

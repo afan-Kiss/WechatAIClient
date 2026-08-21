@@ -320,7 +320,7 @@ public class Round53MultiAccountMediaTests
         var manager = CreateManager();
         await manager.LoadProfilesAsync();
         var duplicate = Profile("p2", "第二", "http://127.0.0.1:19089", 5000, 61109);
-        Assert.Throws<InvalidOperationException>(() => manager.ValidatePortsOrThrow(duplicate));
+        Assert.Throws<ProfileValidationException>(() => manager.ValidatePortsOrThrow(duplicate));
     }
 
     [Fact]

@@ -39,9 +39,16 @@ public sealed class ChatMessage : System.ComponentModel.INotifyPropertyChanged
     public string SenderInitials { get; set; } = "?";
     public bool IsSelf { get; set; }
     public bool IsFromAi { get; set; }
+    public bool IsGroup { get; set; }
     public MessageSource Source { get; set; } = MessageSource.RemoteUser;
     public MessageType Type { get; set; } = MessageType.Text;
-    public string Content { get; set; } = string.Empty;
+
+    private string _content = string.Empty;
+    public string Content
+    {
+        get => _content;
+        set => SetField(ref _content, value, nameof(Content));
+    }
     public string? FileName { get; set; }
     public string? FileSize { get; set; }
     public string? QuoteSender { get; set; }

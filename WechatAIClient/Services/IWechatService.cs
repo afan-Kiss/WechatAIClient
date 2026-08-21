@@ -22,6 +22,12 @@ public interface IWechatService
     /// <summary>Whether the target conversation's owning account can send.</summary>
     bool CanSend(ConversationKey key);
 
+    /// <summary>Manual send may work when write API is up even if callbacks are degraded.</summary>
+    bool CanManualSend(ConversationKey key);
+
+    /// <summary>Auto-reply requires a fully connected session (callbacks available).</summary>
+    bool CanAutoReply(ConversationKey key);
+
     Task SelectAccountAsync(string? accountId, CancellationToken cancellationToken = default);
 
     Task<WechatConnectionState> GetConnectionStateAsync(CancellationToken cancellationToken = default);

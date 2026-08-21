@@ -440,8 +440,15 @@ public sealed class WechatAccountSession : IAsyncDisposable
         var accountChanged = false;
         lock (_gate)
         {
+            // Prefer live identity; fall back to provisional AccountId (ExpectedWxid/ProfileId).
             oldId = _identity?.AccountId;
-            if (string.Equals(oldId, wxid, StringComparison.Ordinal) &&
+            if (string.IsNullOrWhiteSpace(oldId) &&
+                !string.Equals(AccountId, Profile.ProfileId, StringComparison.Ordinal))
+            {
+                oldId = AccountId;
+            }
+
+            if (string.Equals(_identity?.AccountId, wxid, StringComparison.Ordinal) &&
                 _identity is not null &&
                 string.Equals(_identity.DisplayName, displayName, StringComparison.Ordinal) &&
                 string.Equals(_identity.AvatarUrl, avatar, StringComparison.Ordinal))
@@ -451,9 +458,12 @@ public sealed class WechatAccountSession : IAsyncDisposable
 
             accountChanged = !string.IsNullOrWhiteSpace(oldId) &&
                              !string.Equals(oldId, wxid, StringComparison.Ordinal);
-            if (accountChanged)
+            if (accountChanged || _identity is null)
             {
-                ClearAccountCachesLocked();
+                if (accountChanged)
+                {
+                    ClearAccountCachesLocked();
+                }
             }
 
             _identity = new WechatAccountIdentity(wxid, wxid, displayName, avatar);
@@ -463,7 +473,7 @@ public sealed class WechatAccountSession : IAsyncDisposable
         IdentityChanged?.Invoke(this, new AccountIdentityChangedEventArgs
         {
             ProfileId = Profile.ProfileId,
-            OldAccountId = oldId,
+            OldAccountId = string.Equals(oldId, wxid, StringComparison.Ordinal) ? null : oldId,
             NewAccountId = wxid
         });
     }
@@ -481,16 +491,55 @@ public sealed class WechatAccountSession : IAsyncDisposable
 
     private async Task RefreshContactsCacheAsync(CancellationToken cancellationToken)
     {
-        try
+        Exception? firstError = null;
+        var okCount = 0;
+        async Task<IReadOnlyList<BridgeContact>> LoadOne(Func<CancellationToken, Task<IReadOnlyList<BridgeContact>>> loader)
         {
-            var recent = await _bridge.GetRecentAsync(cancellationToken);
-            var friends = await _bridge.GetContactsAsync(cancellationToken);
-            var groups = await _bridge.GetGroupsAsync(cancellationToken);
-            StoreContacts(recent.Concat(friends).Concat(groups).Select(MapContact));
+            try
+            {
+                var list = await loader(cancellationToken);
+                Interlocked.Increment(ref okCount);
+                return list;
+            }
+            catch (Exception ex)
+            {
+                firstError ??= ex;
+                _logger.LogDebug(ex, "Partial contacts refresh failed for {ProfileId}", Profile.ProfileId);
+                return Array.Empty<BridgeContact>();
+            }
         }
-        catch (Exception ex)
+
+        var recentTask = LoadOne(_bridge.GetRecentAsync);
+        var friendsTask = LoadOne(_bridge.GetContactsAsync);
+        var groupsTask = LoadOne(_bridge.GetGroupsAsync);
+        await Task.WhenAll(recentTask, friendsTask, groupsTask);
+        StoreContacts(recentTask.Result.Concat(friendsTask.Result).Concat(groupsTask.Result).Select(MapContact));
+
+        if (okCount == 0 && firstError is not null)
         {
-            _logger.LogDebug(ex, "Contacts refresh failed for profile {ProfileId}", Profile.ProfileId);
+            lock (_gate)
+            {
+                if (_state is WechatConnectionState.Connected)
+                {
+                    _state = WechatConnectionState.Degraded;
+                }
+            }
+
+            StateChanged?.Invoke(this, State);
+            throw firstError;
+        }
+
+        if (okCount is > 0 and < 3)
+        {
+            lock (_gate)
+            {
+                if (_state is WechatConnectionState.Connected)
+                {
+                    _state = WechatConnectionState.Degraded;
+                }
+            }
+
+            StateChanged?.Invoke(this, State);
         }
     }
 
@@ -500,12 +549,18 @@ public sealed class WechatAccountSession : IAsyncDisposable
         {
             foreach (var incoming in contacts)
             {
-                incoming.AccountId = AccountId;
                 incoming.AccountDisplayName = Identity?.DisplayName ?? Profile.DisplayName;
                 if (_contacts.TryGetValue(incoming.Id, out var existing))
                 {
+                    var urlChanged = !string.Equals(existing.AvatarUrl, incoming.AvatarUrl, StringComparison.Ordinal);
+                    var needsAvatar = urlChanged ||
+                                      string.IsNullOrWhiteSpace(existing.AvatarLocalPath) ||
+                                      existing.AvatarLoadState is AvatarLoadState.None or AvatarLoadState.Failed;
                     MergeContact(existing, incoming);
-                    ScheduleAvatarLoad(existing);
+                    if (needsAvatar)
+                    {
+                        ScheduleAvatarLoad(existing);
+                    }
                 }
                 else
                 {
@@ -543,7 +598,6 @@ public sealed class WechatAccountSession : IAsyncDisposable
 
         existing.MemberCount = incoming.MemberCount;
         existing.IsOnline = incoming.IsOnline;
-        existing.AccountId = incoming.AccountId;
         existing.AccountDisplayName = incoming.AccountDisplayName;
     }
 
@@ -763,6 +817,7 @@ public sealed class WechatAccountSession : IAsyncDisposable
             SenderInitials = Initials(senderName),
             SenderAvatarUrl = senderAvatarUrl,
             IsSelf = m.IsFromMe,
+            IsGroup = m.IsGroup,
             Source = m.IsFromMe ? MessageSource.LocalUserManual : MessageSource.RemoteUser,
             Type = type,
             Content = content,
@@ -1073,15 +1128,14 @@ public sealed class WechatAccountSession : IAsyncDisposable
             if (dispatcher.CheckAccess())
             {
                 action();
+                return;
             }
-            else
-            {
-                dispatcher.Post(action);
-            }
+
+            dispatcher.Post(action);
         }
-        catch
+        catch (Exception)
         {
-            action();
+            // Never fall back to background-thread UI mutation.
         }
     }
 

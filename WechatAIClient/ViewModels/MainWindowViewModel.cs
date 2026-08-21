@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Avalonia.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -22,7 +23,7 @@ public partial class MainWindowViewModel : ViewModelBase
     private readonly ISettingsStore _settingsStore;
     private readonly IConversationAiCandidateStore _aiCandidates;
     private readonly ILogger<MainWindowViewModel> _logger;
-    private readonly Dictionary<string, CancellationTokenSource> _autoDebounce = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<ConversationKey, CancellationTokenSource> _autoDebounce = new();
     private CancellationTokenSource? _selectionCts;
     private int _selectionVersion;
     private EventHandler<MessageReceivedEventArgs>? _messageReceivedHandler;
@@ -164,10 +165,11 @@ public partial class MainWindowViewModel : ViewModelBase
     private int _navIndex;
 
     public bool IsChatNav => NavIndex == 0;
-    public bool IsContactsNav => NavIndex == 1;
-    public bool IsFavoritesNav => NavIndex == 2;
+    public bool IsContactsNav => false;
+    public bool IsFavoritesNav => false;
     public bool IsSettingsNav => NavIndex == 3;
-    public bool IsFavoritesVisible => NavIndex == 2;
+    public bool IsFavoritesVisible => false;
+    public bool IsAggregateAccountView => _wechatService.SelectedAccountId is null;
 
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(AiPanelToggleText))]
@@ -383,10 +385,14 @@ public partial class MainWindowViewModel : ViewModelBase
 
     private void RestoreAiCandidate(ConversationKey key)
     {
-        if (_aiCandidates.TryGet(key, out var content))
+        if (!_aiCandidates.TryGet(key, out var content))
         {
-            AiPanel.LatestGeneratedReply = content;
+            AiPanel.LatestGeneratedReply = string.Empty;
+            return;
         }
+
+        // Never overwrite a saved per-conversation draft; only show as candidate preview.
+        AiPanel.LatestGeneratedReply = content;
     }
 
     [RelayCommand]
@@ -410,6 +416,7 @@ public partial class MainWindowViewModel : ViewModelBase
         try
         {
             await _wechatService.SelectAccountAsync(item.AccountId, cts.Token);
+            OnPropertyChanged(nameof(IsAggregateAccountView));
             if (version != _selectionVersion || cts.IsCancellationRequested)
             {
                 return;
@@ -506,36 +513,59 @@ public partial class MainWindowViewModel : ViewModelBase
         _selectionCts?.Dispose();
         _selectionCts = null;
 
-        foreach (var cts in _autoDebounce.Values)
+        foreach (var pair in _autoDebounce)
         {
-            cts.Cancel();
-            cts.Dispose();
+            if (_autoDebounce.TryRemove(pair.Key, out var cts))
+            {
+                cts.Cancel();
+                cts.Dispose();
+            }
         }
 
-        _autoDebounce.Clear();
         Chat.Cleanup();
         ContactList.Cleanup();
         AiPanel.CancelGenerationCommand.Execute(null);
         // App owns IWechatService Dispose — do not dispose here.
     }
 
-    private void RefreshWechatStatus(WechatConnectionState state)
+    private void RefreshWechatStatus(WechatConnectionState aggregateState)
     {
-        IsWechatConnected = state == WechatConnectionState.Connected;
-        IsWechatWarning = state is WechatConnectionState.Degraded
-            or WechatConnectionState.VersionUnsupported
-            or WechatConnectionState.BridgeError;
-        WechatStatusText = state switch
+        var accounts = _wechatService.GetAccounts();
+        var selected = _wechatService.SelectedAccountId;
+        if (!string.IsNullOrWhiteSpace(selected))
         {
-            WechatConnectionState.Connected => "● 微信已连接",
-            WechatConnectionState.Degraded => "⚠ Hook 已连接，消息回调不可用",
-            WechatConnectionState.WechatNotRunning => "○ Hook API 未连接",
-            WechatConnectionState.WaitingForLogin => "○ 微信未登录",
-            WechatConnectionState.Connecting => "◐ 初始化中…",
-            WechatConnectionState.VersionUnsupported => "⚠ 版本暂不兼容",
-            WechatConnectionState.BridgeError => "⚠ 微信连接异常",
-            _ => "○ 微信未连接"
-        };
+            var state = _wechatService.GetAccountConnectionState(selected);
+            IsWechatConnected = state == WechatConnectionState.Connected;
+            IsWechatWarning = state is WechatConnectionState.Degraded
+                or WechatConnectionState.VersionUnsupported
+                or WechatConnectionState.BridgeError;
+            WechatStatusText = FormatConnectionState(state);
+            return;
+        }
+
+        var total = Math.Max(accounts.Count, 1);
+        var connected = accounts.Count(a =>
+            _wechatService.GetAccountConnectionState(a.AccountId) == WechatConnectionState.Connected);
+        var degraded = accounts.Count(a =>
+            _wechatService.GetAccountConnectionState(a.AccountId) == WechatConnectionState.Degraded);
+        IsWechatConnected = connected > 0 && connected == total;
+        IsWechatWarning = degraded > 0 || (connected > 0 && connected < total);
+        if (accounts.Count == 0)
+        {
+            WechatStatusText = FormatConnectionState(aggregateState);
+        }
+        else if (connected == total)
+        {
+            WechatStatusText = $"● {connected}/{total} 已连接";
+        }
+        else if (connected > 0 || degraded > 0)
+        {
+            WechatStatusText = $"⚠ {connected}/{total} 已连接";
+        }
+        else
+        {
+            WechatStatusText = $"○ 0/{total} 已连接";
+        }
     }
 
     private async Task LoadWechatProviderSettingsAsync()
@@ -557,9 +587,12 @@ public partial class MainWindowViewModel : ViewModelBase
         }
     }
 
-    private bool EnsureWechatConnectedForSend(ConversationKey key)
+    private bool EnsureWechatConnectedForSend(ConversationKey key, bool autoReply)
     {
-        if (_wechatService.CanSend(key))
+        var ok = autoReply
+            ? _wechatService.CanAutoReply(key)
+            : _wechatService.CanManualSend(key);
+        if (ok)
         {
             return true;
         }
@@ -617,11 +650,7 @@ public partial class MainWindowViewModel : ViewModelBase
             LoadAiProviderSettingsAsync().SafeFireAndForget(_logger);
         }
 
-        if (index == 1)
-        {
-            ContactList.SelectedTabIndex = 1;
-        }
-        else if (index == 0)
+        if (index == 0)
         {
             ContactList.SelectedTabIndex = 0;
         }
@@ -694,10 +723,35 @@ public partial class MainWindowViewModel : ViewModelBase
         try
         {
             WechatStatusText = "○ 正在重连…";
-            await _wechatService.ReconnectAsync();
+            var selected = _wechatService.SelectedAccountId;
+            if (!string.IsNullOrWhiteSpace(selected))
+            {
+                await _wechatService.ReconnectAsync(selected);
+            }
+            else
+            {
+                foreach (var account in _wechatService.GetAccounts())
+                {
+                    var state = _wechatService.GetAccountConnectionState(account.AccountId);
+                    if (state == WechatConnectionState.Connected)
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        await _wechatService.ReconnectAsync(account.AccountId);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Reconnect failed for {AccountId}", account.AccountId);
+                    }
+                }
+            }
+
             RefreshWechatStatus(await _wechatService.GetConnectionStateAsync());
             Chat.NotifyConnectionStateChanged();
-            await _toast.ShowAsync(IsWechatConnected ? "微信已连接" : WechatStatusText);
+            await _toast.ShowAsync(WechatStatusText);
         }
         catch (Exception ex)
         {
@@ -790,13 +844,6 @@ public partial class MainWindowViewModel : ViewModelBase
     }
 
     [RelayCommand]
-    private async Task NotifyPhase2Async(string? feature)
-    {
-        var name = string.IsNullOrWhiteSpace(feature) ? "该功能" : feature;
-        await _toast.ShowAsync($"{name}将在后续版本提供");
-    }
-
-    [RelayCommand]
     private async Task OpenAiContextPreviewAsync()
     {
         if (Chat.CurrentContact is null)
@@ -838,6 +885,7 @@ public partial class MainWindowViewModel : ViewModelBase
         var accountId = string.IsNullOrWhiteSpace(contact.AccountId)
             ? (_wechatService.SelectedAccountId ?? SqliteStore.LegacyAccountId)
             : contact.AccountId;
+        var requestedReplyMode = AiPanel.ReplyMode;
         var pins = await _aiSettings.GetPinnedIdsAsync(accountId, contact.Id);
         var request = new AIGenerationRequest
         {
@@ -846,7 +894,7 @@ public partial class MainWindowViewModel : ViewModelBase
             ContactName = contact.Name,
             ContextSnapshot = Chat.Messages.ToList(),
             ContextLength = AiPanel.ContextLength,
-            ReplyMode = AiPanel.ReplyMode,
+            ReplyMode = requestedReplyMode,
             IncludeOwnMessages = AiPanel.IncludeOwnMessages,
             ReplyStyle = AiPanel.ReplyStyle,
             ReplyLength = AiPanel.ReplyLength,
@@ -867,9 +915,9 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
-        if (AiPanel.ReplyMode == AIReplyMode.Auto)
+        if (requestedReplyMode == AIReplyMode.Auto)
         {
-            if (!EnsureWechatConnectedForSend(key))
+            if (!EnsureWechatConnectedForSend(key, autoReply: true))
             {
                 _aiCandidates.Set(key, result.Content);
                 AiPanel.LatestGeneratedReply = result.Content;
@@ -879,7 +927,7 @@ public partial class MainWindowViewModel : ViewModelBase
             await Chat.SendAsync(accountId, contact.Id, result.Content, isFromAi: true);
             _aiCandidates.Clear(key);
         }
-        else if (AiPanel.ReplyMode == AIReplyMode.ManualConfirm)
+        else if (requestedReplyMode == AIReplyMode.ManualConfirm)
         {
             await ApplyManualConfirmResultAsync(key, result.Content, draftRevision);
         }
@@ -949,48 +997,19 @@ public partial class MainWindowViewModel : ViewModelBase
             return;
         }
 
-        if (!_wechatService.CanSend(new ConversationKey(e.AccountId, e.ContactId)) &&
-            AiPanel.ReplyMode == AIReplyMode.Auto)
-        {
-            // Auto must not send while this account is disconnected; Manual can still generate later.
-            return;
-        }
-
+        // Global pause only — does not use current panel ReplyMode.
         if (AiPanel.IsAutoPaused)
         {
             return;
         }
 
-        if (!AiPanel.AutoGenerateOnReceive)
-        {
-            return;
-        }
-
-        var contact = ContactList.FindContact(e.AccountId, e.ContactId) ??
-                      (Chat.CurrentContact?.Id == e.ContactId &&
-                       string.Equals(Chat.CurrentContact?.AccountId, e.AccountId, StringComparison.Ordinal)
-                          ? Chat.CurrentContact
-                          : null);
-
-        if (contact?.Type == ContactType.Group)
-        {
-            if (!PassesGroupTrigger(AiPanel.GroupTriggerMode, e.Message))
-            {
-                return;
-            }
-        }
-
-        if (AiPanel.ReplyMode == AIReplyMode.Auto)
-        {
-            ScheduleAutoGenerate(e.AccountId, e.ContactId, e.Message.Id, autoSend: true);
-        }
-        else if (AiPanel.ReplyMode == AIReplyMode.ManualConfirm)
-        {
-            ScheduleAutoGenerate(e.AccountId, e.ContactId, e.Message.Id, autoSend: false);
-        }
+        var target = new ConversationKey(
+            SqliteStore.NormalizeAccountId(e.AccountId),
+            e.ContactId);
+        ScheduleAutoGenerate(target, e.Message.Id);
     }
 
-    private static bool PassesGroupTrigger(GroupTriggerMode mode, ChatMessage message)
+    internal static bool PassesGroupTrigger(GroupTriggerMode mode, ChatMessage message)
     {
         return mode switch
         {
@@ -999,35 +1018,30 @@ public partial class MainWindowViewModel : ViewModelBase
             GroupTriggerMode.MentionMeOnly => message.MentionsMe,
             GroupTriggerMode.QuoteMeOnly => message.QuotesMe,
             GroupTriggerMode.MentionOrQuoteMe => message.MentionsMe || message.QuotesMe,
-            _ => true
+            _ => false
         };
     }
 
-    private void ScheduleAutoGenerate(string accountId, string contactId, string? triggerMessageId, bool autoSend)
+    private void ScheduleAutoGenerate(ConversationKey target, string? triggerMessageId)
     {
-        var key = new ConversationKey(
-            SqliteStore.NormalizeAccountId(accountId),
-            contactId).StableKey;
-        if (_autoDebounce.TryGetValue(key, out var existing))
+        var cts = new CancellationTokenSource();
+        if (_autoDebounce.TryRemove(target, out var existing))
         {
             existing.Cancel();
             existing.Dispose();
         }
 
-        var cts = new CancellationTokenSource();
-        _autoDebounce[key] = cts;
-
-        DebouncedAutoGenerateAsync(accountId, contactId, triggerMessageId, autoSend, cts.Token)
+        _autoDebounce[target] = cts;
+        DebouncedAutoGenerateAsync(target, triggerMessageId, cts)
             .SafeFireAndForget(_logger);
     }
 
     private async Task DebouncedAutoGenerateAsync(
-        string accountId,
-        string contactId,
+        ConversationKey target,
         string? triggerMessageId,
-        bool autoSend,
-        CancellationToken cancellationToken)
+        CancellationTokenSource ownedCts)
     {
+        var cancellationToken = ownedCts.Token;
         try
         {
             await Task.Delay(1200, cancellationToken);
@@ -1041,38 +1055,66 @@ public partial class MainWindowViewModel : ViewModelBase
                 return;
             }
 
-            var resolvedAccountId = SqliteStore.NormalizeAccountId(accountId);
-            var convKey = new ConversationKey(resolvedAccountId, contactId);
-            var messages = await _wechatService.GetMessagesAsync(convKey, cancellationToken);
-            var contact = ContactList.FindContact(resolvedAccountId, contactId);
-            if (contact is null &&
-                Chat.CurrentContact?.Id == contactId &&
-                string.Equals(Chat.CurrentContact?.AccountId, resolvedAccountId, StringComparison.Ordinal))
+            var effective = await _aiSettings.GetEffectiveAsync(
+                target.AccountId,
+                target.ConversationId,
+                cancellationToken);
+
+            if (effective.ReplyMode == AIReplyMode.Off ||
+                !effective.AutoGenerateOnReceive)
+            {
+                return;
+            }
+
+            var isGroup = await ResolveIsGroupAsync(target, cancellationToken);
+            var messages = await _wechatService.GetMessagesAsync(target, cancellationToken);
+            var trigger = messages.LastOrDefault(m =>
+                string.Equals(m.Id, triggerMessageId, StringComparison.Ordinal))
+                ?? messages.LastOrDefault();
+            if (trigger is null)
+            {
+                return;
+            }
+
+            isGroup = trigger.IsGroup || isGroup;
+            if (isGroup && !PassesGroupTrigger(effective.GroupTriggerMode, trigger))
+            {
+                return;
+            }
+
+            if (effective.ReplyMode == AIReplyMode.Auto &&
+                !EnsureWechatConnectedForSend(target, autoReply: true))
+            {
+                return;
+            }
+
+            var contact = ContactList.FindContact(target.AccountId, target.ConversationId);
+            if (contact is null && Chat.CurrentContact?.Key == target)
             {
                 contact = Chat.CurrentContact;
             }
 
-            var contactName = contact?.Name ?? contactId;
-            var isGroup = contact?.Type == ContactType.Group;
-            var replyMode = autoSend ? AIReplyMode.Auto : AIReplyMode.ManualConfirm;
-            var draftRevision =
-                Chat.CurrentContact?.Key == convKey
-                    ? Chat.DraftRevision
-                    : (int?)null;
-            var pins = await _aiSettings.GetPinnedIdsAsync(resolvedAccountId, contactId, cancellationToken);
-            var effective = await _aiSettings.GetEffectiveAsync(resolvedAccountId, contactId, cancellationToken);
+            var contactName = contact?.Name ?? target.ConversationId;
+            var draftRevision = Chat.CurrentContact?.Key == target
+                ? Chat.DraftRevision
+                : (int?)null;
+            var pins = await _aiSettings.GetPinnedIdsAsync(
+                target.AccountId,
+                target.ConversationId,
+                cancellationToken);
 
+            var requestedReplyMode = effective.ReplyMode;
             var request = new AIGenerationRequest
             {
-                AccountId = resolvedAccountId,
-                ContactId = contactId,
+                AccountId = target.AccountId,
+                ContactId = target.ConversationId,
                 ContactName = contactName,
-                TriggerAccountId = resolvedAccountId,
-                TriggerConversationId = contactId,
+                TriggerAccountId = target.AccountId,
+                TriggerConversationId = target.ConversationId,
                 TriggerMessageId = triggerMessageId,
                 ContextSnapshot = messages.ToList(),
                 ContextLength = effective.ContextCount,
-                ReplyMode = replyMode,
+                ReplyMode = requestedReplyMode,
                 IncludeOwnMessages = effective.IncludeOwnMessages,
                 ReplyStyle = effective.ReplyStyle,
                 ReplyLength = effective.ReplyLength,
@@ -1090,12 +1132,12 @@ public partial class MainWindowViewModel : ViewModelBase
                 return;
             }
 
-            if (autoSend)
+            if (requestedReplyMode == AIReplyMode.Auto)
             {
-                if (!EnsureWechatConnectedForSend(convKey))
+                if (!EnsureWechatConnectedForSend(target, autoReply: true))
                 {
-                    _aiCandidates.Set(convKey, result.Content);
-                    if (Chat.CurrentContact?.Key == convKey)
+                    _aiCandidates.Set(target, result.Content);
+                    if (Chat.CurrentContact?.Key == target)
                     {
                         AiPanel.LatestGeneratedReply = result.Content;
                     }
@@ -1104,19 +1146,22 @@ public partial class MainWindowViewModel : ViewModelBase
                     return;
                 }
 
-                await Chat.SendAsync(resolvedAccountId, contactId, result.Content, isFromAi: true);
-                _aiCandidates.Clear(convKey);
+                await Chat.SendAsync(target.AccountId, target.ConversationId, result.Content, isFromAi: true);
+                _aiCandidates.Clear(target);
             }
-            else if (draftRevision is int rev)
+            else if (requestedReplyMode == AIReplyMode.ManualConfirm)
             {
-                await ApplyManualConfirmResultAsync(convKey, result.Content, rev);
-            }
-            else
-            {
-                _aiCandidates.Set(convKey, result.Content);
-                if (Chat.CurrentContact?.Key == convKey)
+                if (draftRevision is int rev)
                 {
-                    AiPanel.LatestGeneratedReply = result.Content;
+                    await ApplyManualConfirmResultAsync(target, result.Content, rev);
+                }
+                else
+                {
+                    _aiCandidates.Set(target, result.Content);
+                    if (Chat.CurrentContact?.Key == target)
+                    {
+                        AiPanel.LatestGeneratedReply = result.Content;
+                    }
                 }
             }
         }
@@ -1126,12 +1171,43 @@ public partial class MainWindowViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Auto AI reply failed for {AccountId}/{ContactId}", accountId, contactId);
+            _logger.LogError(ex, "Auto AI reply failed for {Key}", target);
+        }
+        finally
+        {
+            if (_autoDebounce.TryGetValue(target, out var current) &&
+                ReferenceEquals(current, ownedCts) &&
+                _autoDebounce.TryRemove(target, out var removed) &&
+                ReferenceEquals(removed, ownedCts))
+            {
+                ownedCts.Dispose();
+            }
+        }
+    }
+
+    private async Task<bool> ResolveIsGroupAsync(ConversationKey target, CancellationToken cancellationToken)
+    {
+        var contact = ContactList.FindContact(target.AccountId, target.ConversationId);
+        if (contact is not null)
+        {
+            return contact.Type == ContactType.Group;
+        }
+
+        try
+        {
+            var groups = await _wechatService.GetGroupsAsync(cancellationToken);
+            return groups.Any(g =>
+                string.Equals(g.AccountId, target.AccountId, StringComparison.Ordinal) &&
+                string.Equals(g.Id, target.ConversationId, StringComparison.Ordinal));
+        }
+        catch
+        {
+            return target.ConversationId.Contains("@chatroom", StringComparison.OrdinalIgnoreCase);
         }
     }
 
     [RelayCommand]
-    private void BeginAddAccountProfile()
+    private async Task BeginAddAccountProfileAsync()
     {
         var profiles = _accountManager.Profiles;
         var nextHttp = profiles.Count == 0 ? 5000 : profiles.Max(p => p.HttpCallbackPort) + 1;
@@ -1143,6 +1219,7 @@ public partial class MainWindowViewModel : ViewModelBase
         EditProfileHttpPort = nextHttp;
         EditProfileTcpPort = nextTcp;
         IsEditingAccountProfile = true;
+        await _toast.ShowAsync("请按该 Hook 实例实际端口填写");
     }
 
     [RelayCommand]
@@ -1229,12 +1306,17 @@ public partial class MainWindowViewModel : ViewModelBase
             RefreshAccountProfileCards();
             RefreshAccountMenu();
         }
+        catch (ProfileValidationException pex)
+        {
+            _logger.LogWarning(pex, "Profile validation failed");
+            await _toast.ShowAsync(pex.Code == ProfileValidationErrorCode.PortConflict
+                ? "端口冲突，请修改后重试"
+                : pex.Message);
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to save account profile");
-            await _toast.ShowAsync(ex.Message.Contains("port", StringComparison.OrdinalIgnoreCase)
-                ? "端口冲突，请修改后重试"
-                : "保存失败");
+            await _toast.ShowAsync("保存失败");
         }
     }
 

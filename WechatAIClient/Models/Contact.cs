@@ -6,12 +6,13 @@ public partial class Contact : ObservableObject
 {
     public string Id { get; set; } = string.Empty;
 
-    /// <summary>Owning WeChat account wxid / AccountId.</summary>
-    public string AccountId { get; set; } = string.Empty;
-
-    public string? AccountDisplayName { get; set; }
+    /// <summary>Owning WeChat account wxid / AccountId. Immutable after create.</summary>
+    public string AccountId { get; init; } = string.Empty;
 
     public ConversationKey Key => new(AccountId, Id);
+
+    [ObservableProperty]
+    private string? _accountDisplayName;
 
     [ObservableProperty]
     private string _name = string.Empty;

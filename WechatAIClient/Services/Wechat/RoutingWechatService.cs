@@ -56,6 +56,10 @@ public sealed class RoutingWechatService : IWechatService, IAsyncDisposable
 
     public bool CanSend(ConversationKey key) => _active.CanSend(key);
 
+    public bool CanManualSend(ConversationKey key) => _active.CanManualSend(key);
+
+    public bool CanAutoReply(ConversationKey key) => _active.CanAutoReply(key);
+
     public async Task SelectAccountAsync(string? accountId, CancellationToken cancellationToken = default)
     {
         await ResolveAsync(force: false, cancellationToken);

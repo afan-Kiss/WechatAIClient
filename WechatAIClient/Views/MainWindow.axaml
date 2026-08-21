@@ -175,7 +175,7 @@
                                      Foreground="{DynamicResource TextMutedBrush}"
                                      FontSize="10"
                                      TextTrimming="CharacterEllipsis"
-                                     IsVisible="{Binding AccountDisplayName, Converter={x:Static StringConverters.IsNotNullOrEmpty}}" />
+                                     IsVisible="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).IsAggregateAccountView}" />
                         </StackPanel>
                         <TextBlock Grid.Column="2"
                                    Text="{Binding LastMessageTime, Converter={StaticResource TimeDisplayConverter}}"
@@ -243,7 +243,7 @@
                       CornerRadius="12"
                       Background="{DynamicResource InputBackgroundBrush}"
                       DataContext="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext)}">
-                <Grid ColumnDefinitions="*,*,*,*">
+                <Grid ColumnDefinitions="*,*">
                   <Button Classes="nav-icon"
                           Classes.active="{Binding IsChatNav}"
                           Command="{Binding SelectNavCommand}"
@@ -251,20 +251,6 @@
                           Content="💬"
                           ToolTip.Tip="聊天" />
                   <Button Grid.Column="1"
-                          Classes="nav-icon"
-                          Classes.active="{Binding IsContactsNav}"
-                          Command="{Binding SelectNavCommand}"
-                          CommandParameter="1"
-                          Content="👤"
-                          ToolTip.Tip="联系人" />
-                  <Button Grid.Column="2"
-                          Classes="nav-icon"
-                          Classes.active="{Binding IsFavoritesNav}"
-                          Command="{Binding SelectNavCommand}"
-                          CommandParameter="2"
-                          Content="★"
-                          ToolTip.Tip="收藏" />
-                  <Button Grid.Column="3"
                           Classes="nav-icon"
                           Classes.active="{Binding IsSettingsNav}"
                           Command="{Binding ToggleSettingsCommand}"
@@ -319,31 +305,7 @@
                                  Foreground="{DynamicResource TextMutedBrush}"
                                  IsVisible="{Binding !CurrentContact.IsOnline}" />
                     </StackPanel>
-                    <StackPanel Grid.Column="2"
-                                Orientation="Horizontal"
-                                Spacing="4"
-                                VerticalAlignment="Center">
-                      <Button Classes="glass-button"
-                              Content="🔍"
-                              ToolTip.Tip="搜索"
-                              Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).NotifyPhase2Command}"
-                              CommandParameter="聊天内搜索" />
-                      <Button Classes="glass-button"
-                              Content="📞"
-                              ToolTip.Tip="电话"
-                              Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).NotifyPhase2Command}"
-                              CommandParameter="语音通话" />
-                      <Button Classes="glass-button"
-                              Content="🎥"
-                              ToolTip.Tip="视频"
-                              Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).NotifyPhase2Command}"
-                              CommandParameter="视频通话" />
-                      <Button Classes="glass-button"
-                              Content="⋯"
-                              ToolTip.Tip="更多"
-                              Command="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).NotifyPhase2Command}"
-                              CommandParameter="更多操作" />
-                    </StackPanel>
+                    <!-- 电话/视频/更多/搜索假按钮已移除 -->
                   </Grid>
                 </Border>
 
@@ -448,20 +410,18 @@
                                           <TextBlock Text="图片加载失败"
                                                      Foreground="{DynamicResource TextMutedBrush}"
                                                      HorizontalAlignment="Center" />
-                                          <TextBlock Text="{Binding MediaError}"
+                                          <TextBlock Text="加载失败，可稍后重试"
                                                      FontSize="11"
                                                      Foreground="{DynamicResource TextMutedBrush}"
-                                                     TextWrapping="Wrap"
-                                                     MaxWidth="200"
                                                      HorizontalAlignment="Center" />
                                         </StackPanel>
-                                        <Image Source="{Binding ResolvedMediaPath, Converter={StaticResource PathToBitmapConverter}}"
-                                               MaxWidth="320"
-                                               MaxHeight="300"
-                                               Stretch="Uniform"
-                                               HorizontalAlignment="Center"
-                                               VerticalAlignment="Center"
-                                               IsVisible="{Binding IsMediaLoaded}" />
+                                        <controls:MediaImage Path="{Binding ResolvedMediaPath}"
+                                                             MaxWidth="320"
+                                                             MaxHeight="300"
+                                                             Stretch="Uniform"
+                                                             HorizontalAlignment="Center"
+                                                             VerticalAlignment="Center"
+                                                             IsVisible="{Binding IsMediaLoaded}" />
                                       </Panel>
                                     </Border>
 
@@ -474,11 +434,11 @@
                                                    IsVisible="{Binding IsMediaPlaceholder}"
                                                    Foreground="{DynamicResource TextSecondaryBrush}"
                                                    Margin="8" />
-                                        <Image Source="{Binding ResolvedMediaPath, Converter={StaticResource PathToBitmapConverter}}"
-                                               MaxWidth="160"
-                                               MaxHeight="160"
-                                               Stretch="Uniform"
-                                               IsVisible="{Binding IsMediaLoaded}" />
+                                        <controls:MediaImage Path="{Binding ResolvedMediaPath}"
+                                                             MaxWidth="160"
+                                                             MaxHeight="160"
+                                                             Stretch="Uniform"
+                                                             IsVisible="{Binding IsMediaLoaded}" />
                                       </Panel>
                                     </Border>
 
@@ -498,37 +458,6 @@
                                                TextWrapping="Wrap"
                                                FontSize="14"
                                                IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=Unknown}" />
-
-                                    <Border IsVisible="{Binding Type, Converter={StaticResource MessageTypeEqualsConverter}, ConverterParameter=FileLegacyHidden}"
-                                            Background="{DynamicResource QuoteBackgroundBrush}"
-                                            CornerRadius="10"
-                                            Padding="12"
-                                            MaxWidth="{Binding $parent[Window].((vm:MainWindowViewModel)DataContext).Chat.BubbleMaxWidth}">
-                                      <Grid ColumnDefinitions="Auto,*">
-                                        <Border Width="36"
-                                                Height="36"
-                                                CornerRadius="8"
-                                                Margin="0,0,10,0"
-                                                Background="{DynamicResource AccentBrush}">
-                                          <TextBlock Text="FILE"
-                                                     Foreground="White"
-                                                     FontSize="9"
-                                                     HorizontalAlignment="Center"
-                                                     VerticalAlignment="Center" />
-                                        </Border>
-                                        <StackPanel Grid.Column="1" MinWidth="0">
-                                          <TextBlock Text="{Binding FileName}"
-                                                     FontWeight="SemiBold"
-                                                     FontSize="13"
-                                                     MinWidth="0"
-                                                     TextTrimming="CharacterEllipsis"
-                                                     TextWrapping="NoWrap" />
-                                          <TextBlock Text="{Binding FileSize}"
-                                                     Foreground="{DynamicResource TextMutedBrush}"
-                                                     FontSize="11" />
-                                        </StackPanel>
-                                      </Grid>
-                                    </Border>
 
                                     <TextBlock Text="{Binding Content}"
                                                TextWrapping="Wrap"
@@ -866,7 +795,7 @@
                               IsVisible="{Binding IsUsingContactOverride}" />
                       <StackPanel Spacing="4" IsVisible="{Binding IsAutoMode}">
                         <Button Classes="glass-button" HorizontalAlignment="Stretch"
-                                Content="暂停自动回复 30 分钟"
+                                Content="暂停全部自动回复 30 分钟"
                                 Command="{Binding PauseAutoMinutesCommand}" CommandParameter="30"
                                 IsVisible="{Binding !IsAutoPaused}" />
                         <Button Classes="glass-button" HorizontalAlignment="Stretch"
@@ -1333,7 +1262,7 @@
                 </StackPanel>
               </ScrollViewer>
               <TextBlock Grid.Row="2"
-                         Text="WechatAIClient · Round 4 WeChat"
+                         Text="WechatAIClient"
                          Foreground="{DynamicResource TextMutedBrush}"
                          FontSize="11"
                          HorizontalAlignment="Center" />

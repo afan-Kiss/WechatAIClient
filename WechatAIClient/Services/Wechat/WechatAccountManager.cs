@@ -64,6 +64,7 @@ public sealed class WechatAccountManager : IWechatAccountManager
     private readonly Dictionary<string, WechatAccountSession> _sessionsByProfileId = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _accountIdToProfileId = new(StringComparer.Ordinal);
     private string? _selectedAccountId;
+    private bool _profilesLoaded;
     private bool _disposed;
 
     public WechatAccountManager(
@@ -168,6 +169,8 @@ public sealed class WechatAccountManager : IWechatAccountManager
             {
                 _selectedAccountId = selectedRaw;
             }
+
+            _profilesLoaded = true;
         }
     }
 
@@ -203,7 +206,16 @@ public sealed class WechatAccountManager : IWechatAccountManager
     public async Task StartAllAsync(CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        await LoadProfilesAsync(cancellationToken);
+        bool loaded;
+        lock (_gate)
+        {
+            loaded = _profilesLoaded;
+        }
+
+        if (!loaded)
+        {
+            await LoadProfilesAsync(cancellationToken);
+        }
 
         List<WechatAccountConnectionProfile> enabled;
         lock (_gate)
@@ -496,6 +508,11 @@ public sealed class WechatAccountManager : IWechatAccountManager
     public void ValidatePortsOrThrow(WechatAccountConnectionProfile candidate, string? excludeProfileId = null)
     {
         ArgumentNullException.ThrowIfNull(candidate);
+        if (!candidate.Enabled)
+        {
+            return;
+        }
+
         lock (_gate)
         {
             foreach (var other in _profiles)
@@ -506,20 +523,22 @@ public sealed class WechatAccountManager : IWechatAccountManager
                     continue;
                 }
 
-                if (!other.Enabled && !candidate.Enabled)
+                if (!other.Enabled)
                 {
                     continue;
                 }
 
                 if (other.HttpCallbackPort == candidate.HttpCallbackPort)
                 {
-                    throw new InvalidOperationException(
+                    throw new ProfileValidationException(
+                        ProfileValidationErrorCode.PortConflict,
                         $"HTTP callback 端口冲突：{candidate.HttpCallbackPort} 已被 {other.DisplayName} 使用");
                 }
 
                 if (other.TcpCallbackPort == candidate.TcpCallbackPort)
                 {
-                    throw new InvalidOperationException(
+                    throw new ProfileValidationException(
+                        ProfileValidationErrorCode.PortConflict,
                         $"TCP callback 端口冲突：{candidate.TcpCallbackPort} 已被 {other.DisplayName} 使用");
                 }
             }
@@ -565,16 +584,24 @@ public sealed class WechatAccountManager : IWechatAccountManager
                     _parser,
                     _mediaCache);
                 _sessionsByProfileId[profile.ProfileId] = session;
-                if (!string.IsNullOrWhiteSpace(session.AccountId))
-                {
-                    _accountIdToProfileId[session.AccountId] = profile.ProfileId;
-                }
-
+                // Do not register ExpectedAccountWxid as account alias until IdentityChanged
+                // confirms the live Hook wxid — avoids stale A→B routing.
                 Wire(session);
             }
         }
 
         await session.StartAsync(cancellationToken);
+    }
+
+    /// <summary>Test helper: attach a prebuilt session without starting a real Hook client.</summary>
+    internal void RegisterTestSession(WechatAccountSession session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        lock (_gate)
+        {
+            _sessionsByProfileId[session.Profile.ProfileId] = session;
+            Wire(session);
+        }
     }
 
     private async Task DisposeSessionAsync(WechatAccountSession session)

@@ -82,11 +82,16 @@ public sealed class MockWechatService : IWechatService
         }
     }
 
-    public bool CanSend(ConversationKey key)
+    public bool CanSend(ConversationKey key) => CanManualSend(key);
+
+    public bool CanManualSend(ConversationKey key)
     {
         var state = GetAccountConnectionState(key.AccountId);
-        return state == WechatConnectionState.Connected;
+        return state is WechatConnectionState.Connected or WechatConnectionState.Degraded;
     }
+
+    public bool CanAutoReply(ConversationKey key)
+        => GetAccountConnectionState(key.AccountId) == WechatConnectionState.Connected;
 
     public Task SelectAccountAsync(string? accountId, CancellationToken cancellationToken = default)
     {

@@ -92,7 +92,7 @@ public partial class ChatViewModel : ViewModelBase
         !IsSending &&
         CurrentContact is not null &&
         !string.IsNullOrWhiteSpace(DraftText) &&
-        _wechatService.CanSend(CurrentContact.Key);
+        _wechatService.CanManualSend(CurrentContact.Key);
 
     public void NotifyConnectionStateChanged() => NotifyCanSendChanged();
 
